@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data, trained runs and job outputs live outside git (see README: data/ and outputs/
+# hold symlinks or local copies; the eval JSONs of record are kept with the runs).
+data/*
+!data/.gitkeep
+outputs/*
+!outputs/.gitkeep
+*.pt
+*.pth
+*.h5
+*.npz
+*.npy
+
+# SLURM / job logs
+*.log
+slurm-*.out
+
+# per-run config backups written by the trainers (the copy of record lives in the run directory)
+configs/pointcloud_ffm/
+configs/backup/
+configs/isotropic_turbulence/
+configs/**/det_baseline/
+configs/**/gen_baseline/
+
+# legacy run-tree path some scripts still create; the run tree of record is outputs/runs
+Save_TrainedModel/
+
+# JHTDB downloads (src/data_prep/jhtdb)
+src/data_prep/jhtdb/outputfiles*/

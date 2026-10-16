@@ -1,0 +1,117 @@
+# SEED REPLICATE (seed 1337) of configs/kolmogorov2d/config_baseline_MLPRBF_kolm_sig002.yaml -- identical otherwise.
+# =============================================================================
+# PoF-benchmark 2D Kolmogorov (Shu et al., 256^2 vorticity, 40 trajectories)
+# Deterministic baselines. Trajectory-holdout protocol: frames [0,2560) = 32
+# train trajectories, [2560,3200) = 8 held-out trajectories; launchers must set
+# JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 and train_ratio 0.8 to reproduce it.
+# Sensor budget mirrors the JHU fractional protocol: 0.1-10% of 65536 points.
+# Budget target ~50k optimizer steps (bs 128 -> 20 steps/epoch -> 2500 epochs).
+# MLP-RBF has no upstream: AdamW + cosine schedule of the benchmark trainer. rbf_sigma is
+# chosen on TUNE from {0.02, 0.05, 0.1} (this file 0.05; *_sig002 / *_sig01 variants).
+# =============================================================================
+
+baseline_model: "mlp_rbf"  # `mlp_rbf`, `senseiver`, or `geofno`
+training_stage: 1
+
+shared:
+  demo_num: 764
+  seed: 1337
+  device_ids: [0]
+  reload: true
+
+  paths:
+    data_path: "data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5"
+    save_root: "outputs/runs/kolmogorov2d_seed1337/baseline_mlp_rbf"
+    config_backup_root: "configs/kolmogorov2d_seed1337/det_baseline"
+
+  data:
+    dataset_name: "kolmogorov2d"
+    train_ratio: 0.8
+    time_stride: 1
+    num_workers: 4
+    num_x: 256
+    num_y: 256
+    field_names: ["vorticity"]
+
+  conditioning:
+    cond_fields: [0]           # vorticity (single-channel dataset)
+    n_obs_min_list: [65]       # 0.1% of 256^2
+    n_obs_max_list: [6554]      # 10%
+    vis_cond_fields: [0]
+    vis_n_obs_list: [655]
+
+  logging:
+    eval_every: 5
+    save_every: 500
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+mlp_rbf_params:
+  training:
+    epochs: 2500
+    batch_size: 128
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+    n_query_points: 4096
+
+  architecture:
+    coord_dim: 3   # 3-wide coord convention (constant z)
+    hidden_dim: 940              # 6.55 M by tools.count_params (was 256: 0.59 M)
+    cond_dim: 128
+    field_embed_dim: 128
+    rbf_sigma: 0.02
+    use_fourier_pe: true
+    fourier_pe_num_bands: 32
+    fourier_pe_max_freq: 64.0
+
+senseiver_params:
+  training:
+    epochs: 2500
+    batch_size: 128
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+    n_query_points: 4096
+
+  architecture:
+    coord_dim: 2
+    num_latents: 128
+    latent_dim: 128
+    num_encoder_layers: 3
+    num_self_attn_per_block: 3
+    num_cross_attn_heads: 8
+    num_self_attn_heads: 8
+    dec_num_cross_attn_heads: 8
+    field_embed_dim: 32
+    space_bands: 32
+    max_freq: 64.0
+    ff_mult: 4
+    dropout: 0.0
+
+geofno_params:
+  training:
+    epochs: 2500
+    batch_size: 32
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+
+  architecture:
+    geofno_variant: "fno"
+    fno_modes_x: 32
+    fno_modes_y: 32
+    fno_hidden_channels: 64
+    fno_n_layers: 4
+
+    latent_Nx: 64
+    latent_Ny: 64
+    gno_radius: 0.1
+    gno_transform_type: "linear"

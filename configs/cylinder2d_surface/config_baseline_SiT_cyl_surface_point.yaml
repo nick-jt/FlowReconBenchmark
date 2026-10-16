@@ -1,0 +1,96 @@
+# =============================================================================
+# Cylinder SURFACE-TO-FIELD task -- SiT-POINT (point-tokenized) generative
+# baseline on the NATIVE MESH. Sensors ONLY on the 360-cell wall ring (H5
+# surface_indices), all three fields observed at the taps, tap budget swept
+# U{32..360} per field in training. Because the point tokenizer reads the mesh,
+# the full 32/64/128/360 tap sweep is meaningful (the patch-tokenized SiT read
+# the grid export, whose pool is the 62 unique nearest fluid cells, so its 128
+# and 360 entries were the 64 entry by construction).
+# -----------------------------------------------------------------------------
+# Architecture = the 3D JHTDB matched point run (depth 6 x hidden 240 x 4
+# heads, node_subsample 8192, nearest-sensor fill, MSE velocity loss, Euler
+# N=32); protocol identical to config_baseline_Det_cyl_surface. This row
+# REPLACES the patch-tokenized SiT (config_baseline_SiT_cyl_surface, DemoN83)
+# in the surface table (decided 2026-09-28).
+# Budget: bs 24 -> 50 steps/ep -> 1000 ep = 50k optimizer steps.
+# =============================================================================
+
+baseline_model: sit
+training_stage: 1
+
+shared:
+  demo_num: 87
+  seed: 42
+  device_ids: [0]
+  reload: true
+
+  paths:
+    data_path: "data/cylinder2d/Cylinder2D_mesh.h5"
+    save_root: "outputs/runs/cylinder2d_surface/baseline_sit_point"
+    config_backup_root: "configs/cylinder2d_surface/gen_baseline"
+
+  data:
+    dataset_name: "cylinder2d"
+    train_ratio: 0.6667
+    time_stride: 1
+    num_workers: 4
+    num_x: 400                  # unused by the point tokenizer
+    num_y: 200
+    field_names: ["Ux", "Uy", "p"]
+
+  conditioning:
+    cond_fields: [0, 1, 2]      # all fields observed AT THE TAPS only (surface-to-field)
+    sensor_pool: "surface"      # restrict sensors to the H5 surface_indices pool (mesh: 360)
+    n_obs_min_list: [32]        # taps per field U{32..360}
+    n_obs_max_list: [360]
+    vis_cond_fields: [0, 1, 2]
+    vis_n_obs_list: [128]
+
+  logging:
+    eval_every: 5
+    save_every: 200
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+sit_params:
+  training:
+    epochs: 1000                # 50 steps/ep x 1000 = 50k steps
+    batch_size: 24
+    optimizer: upstream         # SiT train.py: AdamW 1e-4, no weight decay, constant LR, no clipping
+    learning_rate: 1.0e-4
+    weight_decay: 0.0
+    eval_every: 5
+    save_every: 200
+    huber_beta: 0.0
+
+  architecture:
+    patch_size: 8               # unused in pointnet mode
+    hidden_size: 240
+    depth: 6
+    num_heads: 4
+    mlp_ratio: 4.0
+    tokenizer: "pointnet"
+    coord_dim: 2
+    fourier_num_freqs: 64
+    fourier_scale: 10.0
+    ema_rate: 0.9999
+    node_subsample: 8192        # token budget per step / sampling chunk (3 chunks per field);
+                                # all 23,800 nodes fit (73.6 GB) but cost 489 s/epoch, 136 h per run
+    cond_fill_sigma: 0.05
+
+  transport:
+    path_type: "Linear"
+    prediction: "velocity"
+    loss_weight:
+
+  conditioning:
+    cond_mode: "interp"
+
+  sampling:
+    sampling_N: 32
+    ode_solver: "euler"
+    benchmark_n_steps: [32]

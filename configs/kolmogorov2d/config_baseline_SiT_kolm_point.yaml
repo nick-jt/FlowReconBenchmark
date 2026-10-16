@@ -1,0 +1,98 @@
+# =============================================================================
+# PoF-benchmark 2D Kolmogorov -- SiT-POINT (point-tokenized) generative baseline.
+# -----------------------------------------------------------------------------
+# The 3D JHTDB configuration (launcher train_sit_xcube_matched: pointnet
+# tokenizer, depth 6 x hidden 240 x 4 heads = 6.57M params, node_subsample
+# 8192 tokens per step / sampling chunk, nearest-sensor fill with soft support,
+# MSE velocity loss, Euler N=32 sampling) brought to the 2D regime: coord_dim 2,
+# one field, and the 2D protocol constants of config_baseline_SiT_kolm.yaml
+# (JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0, train_ratio 0.8, sensors 0.1-10% of
+# 256^2). This row REPLACES the patch-tokenized SiT (config_baseline_SiT_kolm,
+# DemoN62) in the 2D tables (decided 2026-09-28); the patch run is kept on disk
+# as an ablation under baseline_sit/.
+# Tokens per step: a fresh uniform 8192-node subset of the 65,536-point field
+# (1/8 of the field); sensors are drawn from the FULL field under the protocol
+# and reach the tokens by nearest-sensor fill. Sampling reconstructs the field
+# in 8 independent 8192-point chunks (chunk-incoherent single samples are a
+# documented property of this baseline, as in 3D).
+# Budget: bs 24 -> 107 steps/ep -> 470 ep = 50.3k optimizer steps
+# (fleet-matched ~50k, the same budget as the other 2D learned rows).
+# =============================================================================
+
+baseline_model: sit
+training_stage: 1
+
+shared:
+  demo_num: 67
+  seed: 42
+  device_ids: [0]
+  reload: true
+
+  paths:
+    data_path: "data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5"
+    save_root: "outputs/runs/kolmogorov2d/baseline_sit_point"
+    config_backup_root: "configs/kolmogorov2d/gen_baseline"
+
+  data:
+    dataset_name: "kolmogorov2d"
+    train_ratio: 0.8
+    time_stride: 1
+    num_workers: 4
+    num_x: 256                  # unused by the point tokenizer (no grid, no padding)
+    num_y: 256
+    field_names: ["vorticity"]
+
+  conditioning:
+    cond_fields: [0]
+    n_obs_min_list: [65]
+    n_obs_max_list: [6554]
+    vis_cond_fields: [0]
+    vis_n_obs_list: [655]
+
+  logging:
+    eval_every: 5
+    save_every: 100
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+sit_params:
+  training:
+    epochs: 470                 # 107 steps/ep x 470 = 50.3k steps
+    batch_size: 24              # as the JHU point run (24 x 8192 tokens per step)
+    optimizer: upstream         # SiT train.py: AdamW 1e-4, no weight decay, constant LR, no clipping
+    learning_rate: 1.0e-4
+    weight_decay: 0.0
+    eval_every: 5
+    save_every: 100
+    huber_beta: 0.0             # SiT's MSE velocity loss, as the JHU matched run
+
+  architecture:
+    patch_size: 8               # unused in pointnet mode
+    hidden_size: 240            # capacity-matched: 6.57M in 3D (4 fields), ~6.4M here
+    depth: 6
+    num_heads: 4
+    mlp_ratio: 4.0
+    tokenizer: "pointnet"
+    coord_dim: 2
+    fourier_num_freqs: 64
+    fourier_scale: 10.0
+    ema_rate: 0.9999
+    node_subsample: 8192        # token budget per step / sampling chunk
+    cond_fill_sigma: 0.05       # soft-support bandwidth for nearest-sensor fill
+
+  transport:
+    path_type: "Linear"
+    prediction: "velocity"
+    loss_weight:
+
+  conditioning:
+    cond_mode: "interp"         # label only in pointnet mode (nearest fill)
+
+  sampling:
+    sampling_N: 32
+    ode_solver: "euler"
+    benchmark_n_steps: [32]

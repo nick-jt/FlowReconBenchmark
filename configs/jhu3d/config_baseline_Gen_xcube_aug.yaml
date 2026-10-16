@@ -1,0 +1,164 @@
+# =============================================================================
+# Unified Generative Baseline Configuration
+# -----------------------------------------------------------------------------
+# This file is the single entry point for all baseline training/evaluation.
+#
+# Required selectors:
+#   baseline_model : s3gm | latent_fm | sit
+#   training_stage : 1 | 2
+#
+# Stage rules:
+#   - s3gm      : only stage 1 is valid
+#   - sit       : only stage 1 is valid
+#   - latent_fm : stage 1 = autoencoder, stage 2 = latent flow matching
+
+# =============================================================================
+
+baseline_model: latent_fm
+training_stage: 1
+
+shared:
+  demo_num: 23
+  seed: 42
+  device_ids: [0]
+  reload: true
+
+  paths:
+    data_path: data/JHU_4cubes_stride100.h5
+    save_root: outputs/runs/JHU/baseline_latent_fm
+    config_backup_root: configs/isotropic_turbulence/latent_fm
+
+  data:
+    dataset_name: turbulent_combustion
+    train_ratio: 0.75
+    time_stride: 1
+    num_workers: 4
+    num_x: 125
+    num_y: 125
+    num_z: 125
+
+  conditioning:
+    cond_fields: [0, 2]
+    n_obs_min_list: [1953]
+    n_obs_max_list: [19531]
+    vis_cond_fields: [0, 2]
+    vis_n_obs_list:
+
+  logging:
+    eval_every: 5
+    save_every: 500
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+s3gm_params:
+  training:
+    epochs: 10000
+    batch_size: 48
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 200
+
+  architecture:
+    nf: 128
+    ch_mult: [1, 2, 4, 8]
+    num_res_blocks: 2
+    attn_resolutions: [8]
+    num_heads: 1
+    dropout: 0.1
+    use_checkpoint: false
+
+  diffusion:
+    sigma_min: 0.1
+    sigma_max: 7.0
+    num_scales: 1000
+    ema_rate: 0.999
+
+  sampling:
+    sampling_N: 200
+    snr: 0.128
+    n_corrector_steps: 5
+    alpha_obs: 1.0
+    benchmark_n_steps: [200]
+
+latent_fm_params:
+  stage1:
+    training:
+      epochs: 5000
+      batch_size: 8
+      learning_rate: 1.0e-4
+      weight_decay: 1.0e-6
+      eval_every: 5
+      save_every: 200
+
+    architecture:
+      base_ch: 48                    # ae_base_ch; combined Stage 1+2 params ~= 6.53M
+      latent_ch: 48                  # ae_latent_ch
+      n_levels: 3                   # ae_n_levels
+
+  stage2:
+
+    stage1_checkpoint:
+
+    training:
+      epochs: 10000
+      batch_size: 8
+      learning_rate: 2.0e-4
+      weight_decay: 0.0
+      eval_every: 5
+      save_every: 200
+
+    architecture:
+      base_ch: 38                    # fm_base_ch
+      ch_mult: [1, 2]               # fm_ch_mult
+      num_res_blocks: 2             # fm_num_res_blocks (N = 3*2 = 6)
+      num_heads: 8                  # fm_num_heads
+      ema_decay: 0.999                # EMA disabled per plan
+
+    conditioning:
+      cond_mode: "image"
+      pointnet_hidden_mult: 1.0
+
+    sampling:
+      ode_solver: "euler"
+      benchmark_n_steps: [2, 4, 16]
+
+sit_params:
+  training:
+    epochs: 10000
+    batch_size: 32
+    learning_rate: 5.0e-5
+    weight_decay: 0.0001
+    eval_every: 5
+    save_every: 500
+    adam_eps: 1.0e-6
+    huber_beta: 0.1
+
+  architecture:
+    patch_size: 4
+    hidden_size: 256
+    depth: 8
+    num_heads: 4
+    mlp_ratio: 4.0
+    tokenizer: "patch"
+    coord_dim: 2
+    fourier_num_freqs: 64
+    fourier_scale: 10.0
+    ema_rate: 0.9999
+
+  transport:
+    path_type: "Linear"
+    prediction: "velocity"
+    loss_weight:
+
+  conditioning:
+    cond_mode: "interp"
+
+  sampling:
+    sampling_N: 50
+    ode_solver: "euler"
+    benchmark_n_steps: [4, 16, 32, 64]

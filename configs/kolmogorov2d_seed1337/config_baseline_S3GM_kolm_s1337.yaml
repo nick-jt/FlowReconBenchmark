@@ -1,0 +1,159 @@
+# SEED REPLICATE (seed 1337) of configs/kolmogorov2d/config_baseline_S3GM_kolm.yaml -- identical otherwise.
+# =============================================================================
+# PoF-benchmark 2D Kolmogorov — S3GM, the matched 6.35 M row (JHU architecture;
+# config_baseline_S3GM_kolm_published.yaml is the 300.8 M published-size variant). Protocol identical to config_baseline_Det_kolm:
+# JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0, train_ratio 0.8, sensors 0.1-10%.
+# Budget ~50-65k steps/stage: s1 bs 8 -> 320 steps/ep -> 200 ep = 64k;
+# s2 bs 64 -> 40 steps/ep -> 1250 ep = 50k.
+# =============================================================================
+
+baseline_model: s3gm
+training_stage: 1              # run stage 1 then stage 2 (LFM_STAGE pattern)
+
+shared:
+  demo_num: 263
+  seed: 1337
+  device_ids: [0]
+  reload: false              # fresh run: reload would resume the superseded sigma_max=7 run
+
+  paths:
+    data_path: "data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5"
+    save_root: "outputs/runs/kolmogorov2d_seed1337/baseline_s3gm"
+    config_backup_root: "configs/kolmogorov2d_seed1337/gen_baseline"
+
+  data:
+    dataset_name: "kolmogorov2d"
+    train_ratio: 0.8
+    time_stride: 1
+    num_workers: 4
+    num_x: 256
+    num_y: 256
+    field_names: ["vorticity"]
+
+  conditioning:
+    cond_fields: [0]
+    n_obs_min_list: [65]
+    n_obs_max_list: [6554]
+    vis_cond_fields: [0]
+    vis_n_obs_list: [655]
+
+  logging:
+    eval_every: 5
+    save_every: 500
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+s3gm_params:
+  training:
+    epochs: 160                 # bs 8 -> 320 steps/ep -> ~51k steps (budget-matched)
+    batch_size: 8
+    optimizer: upstream        # S3GM: Adam 2e-4, constant LR, no weight decay, no clipping
+    learning_rate: 2.0e-4
+    weight_decay: 0.0
+    eval_every: 5
+    save_every: 40              # visualiser every 40 epochs (was 200: never fired in a 160-epoch run)
+    archive_from: 140          # keep late checkpoints (archive/epoch_XXXX.pt) so the SAMPLER can be
+    archive_every: 20          # compared across epochs; the old run sampled worse late in training
+
+  architecture:
+    nf: 32                     # the JHU architecture: 6.35 M by tools.count_params
+    ch_mult: [1, 2, 3, 4]
+    num_res_blocks: 2
+    attn_resolutions: [8, 16]
+    num_heads: 1
+    dropout: 0.1
+    use_checkpoint: false
+
+  diffusion:
+    sigma_min: 0.1
+    sigma_max: 474.0           # Song-Ermon rule: max pairwise L2 distance between the 2560 z-scored
+                                # training frames (methods.s3gm.sigma_max_rule, 2026-10-03)
+    num_scales: 1000
+    ema_rate: 0.999
+    score_param: eps            # net predicts -noise, score = out/sigma (score_sde VE convention);
+                                # the upstream 'raw' output cannot train stably over a 0.1-750 ladder
+
+  sampling:
+    sampling_N: 500             # fleet step count (was 200): on the 0.1-460 ladder 200 steps leave
+                                # speckle (single-sample rel-L2 0.62 vs 0.28 at 500, epochs 40 and 80)
+    snr: 0.128
+    n_corrector_steps: 5
+    alpha_obs: 1.0
+    benchmark_n_steps: [200, 500, 1000]   # the 0.1-750 ladder needs more than 200 steps: at Kolmogorov
+                                          # epoch 40, 200 steps gave 0.56 single-sample rel-L2, 500 gave 0.26
+
+latent_fm_params:
+  stage1:
+    architecture:
+      base_ch: 64
+      latent_ch: 128
+      n_levels: 3
+    training:
+      epochs: 200
+      batch_size: 8
+      learning_rate: 1.0e-4
+      weight_decay: 1.0e-6
+      eval_every: 5
+      save_every: 50
+
+  stage2:
+    architecture:
+      base_ch: 64
+      ch_mult: [1, 2]
+      num_res_blocks: 3
+      num_heads: 8
+      ema_decay: 0.999
+    conditioning:
+      cond_mode: image
+      pointnet_hidden_mult: 1.0
+    training:
+      epochs: 1250
+      batch_size: 64
+      learning_rate: 1.0e-4
+      weight_decay: 0.0
+      eval_every: 5
+      save_every: 200
+    sampling:
+      ode_solver: euler
+      benchmark_n_steps: [2, 4, 8, 16]
+    stage1_checkpoint:
+
+sit_params:
+  training:
+    epochs: 650
+    batch_size: 32
+    learning_rate: 5.0e-5
+    weight_decay: 0.0001
+    eval_every: 5
+    save_every: 500
+    adam_eps: 1.0e-6
+    huber_beta: 0.1
+
+  architecture:
+    patch_size: 8               # 256/8 = 32x32 tokens (patch 4 would be 4096 tokens)
+    hidden_size: 256
+    depth: 8
+    num_heads: 4
+    mlp_ratio: 4.0
+    tokenizer: "patch"
+    coord_dim: 2
+    fourier_num_freqs: 64
+    fourier_scale: 10.0
+    ema_rate: 0.9999
+
+  transport:
+    path_type: "Linear"
+    prediction: "velocity"
+    loss_weight:
+
+  conditioning:
+    cond_mode: "interp"
+
+  sampling:
+    sampling_N: 50
+    ode_solver: "euler"
+    benchmark_n_steps: [4, 16, 32, 64]

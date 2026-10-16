@@ -1,0 +1,70 @@
+# Datasets. The OpenFOAM runs behind the cylinder file are not part of this repository.
+# python -m launch submit <case> [--variant <name>]; python -m launch list data
+
+convert_cylinder:
+  purpose: Cylinder2D_mesh.h5 (cell centres, Ux Uy p, wall-ring surface indices, train-Re-first frame order) from
+    the OpenFOAM runs at Re 60-250.
+  sbatch:
+    time: 03:00:00
+    mem: 32G
+    cpus: 8
+    gpus: 0
+  body: |
+    set -euo pipefail
+    python3 -m data_prep.convert_cylinder --verify
+    echo "conversion done"
+convert_kolmogorov:
+  purpose: Kolmogorov2D_shu_stride4.h5 from the Shu et al. vorticity array (data/kolmogorov_shu.npy) - trajectory
+    holdout, every fourth frame, training statistics.
+  sbatch:
+    time: 00:30:00
+    mem: 16G
+    cpus: 4
+    gpus: 0
+  body: |
+    set -euo pipefail
+    python3 -m data_prep.convert_kolmogorov --verify "$@"
+download_jhtdb:
+  purpose: JHTDB isotropic1024coarse cutouts - four disjoint 125^3 cubes x 50 frames 100 steps apart, merged into
+    data/JHU_4cubes_stride100.h5 (cubes 0-2 train, cube 3 held out). Needs JHTDB_TOKEN and the givernylocal package.
+  sbatch:
+    time: '24:00:00'
+    mem: 32G
+    cpus: 4
+    gpus: 0
+  body: |
+    set -euo pipefail
+    : "${JHTDB_TOKEN:?set JHTDB_TOKEN to a JHTDB authorization token}"
+    D=src/data_prep/jhtdb
+    python $D/download_jhu_diverse.py              # resumable: existing frames are skipped
+    python $D/download_jhu_diverse.py consolidate  # one H5 per cube
+    python $D/merge_cubes.py                       # frames [0,50)=cube0 ... [150,200)=cube3
+    mkdir -p data
+    ln -sfn "$FRB_ROOT/$D/outputfiles_diverse/JHU_4cubes_stride100.h5" data/JHU_4cubes_stride100.h5
+download_jhtdb_scale:
+  purpose: The 20-cube JHTDB set of the spectral DMF-Gen SM row (cubes 04-23 x 60 frames, held-out cube 3 appended)
+    as data/JHU_20cubes_plus_cube3.h5. Run download_jhtdb first.
+  sbatch:
+    time: '48:00:00'
+    mem: 32G
+    cpus: 4
+    gpus: 0
+  body: |
+    set -euo pipefail
+    : "${JHTDB_TOKEN:?set JHTDB_TOKEN to a JHTDB authorization token}"
+    D=src/data_prep/jhtdb
+    python $D/download_jhu_scale.py
+    python $D/download_jhu_scale.py consolidate
+    python $D/merge_scale.py
+    ln -sfn "$FRB_ROOT/$D/outputfiles_scale/JHU_20cubes_plus_cube3.h5" data/JHU_20cubes_plus_cube3.h5
+export_gen4turb_jhu:
+  purpose: JHTDB fields in the layout the upstream Gen4Turb loader reads (<gen4turb_root>/3_flow_reconstruction/data/u.npy).
+  sbatch:
+    time: 01:00:00
+    mem: 64G
+    cpus: 4
+    gpus: 0
+  body: |
+    set -euo pipefail
+    G4T=$(python -c "from paths import site_path; print(site_path('gen4turb_root'))")
+    python -m data_prep.export_for_baselines --target gen4turb --dataset jhu --out "$G4T/3_flow_reconstruction/data"

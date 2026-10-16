@@ -1,0 +1,633 @@
+# Training of the JHTDB (3D isotropic turbulence) rows. Every run trains on cubes 0-2 with octahedral augmentation (JHU_AUGMENT=octahedral) and validates on the TUNE half of cube 3.
+# python -m launch submit <case> [--variant <name>]; python -m launch list 3d/train
+
+train_iclr_jhu_xcube_aug:
+  purpose: One run of the DMF-Gen trainer (methods.dmfgen.train) - variants DMF-Gen (N15), its spectral-penalty
+    SM row (N29), FNO3D-FM (N90) and the deterministic FNO3D (N97).
+  sbatch:
+    time: '48:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  variants:
+    train_iclr_jhu_xcube_aug:
+      DEMO_NUM: 15
+      config: configs/jhu3d/config_iclr_jhu_xcube_aug.yaml
+    train_iclr_jhu_xcube_spec02:
+      DEMO_NUM: 29
+      config: configs/jhu3d/config_iclr_jhu_xcube_spec02.yaml
+    train_fno3d_xcube:
+      DEMO_NUM: 90
+      config: configs/jhu3d/config_baseline_fno3d_xcube.yaml
+      sbatch:
+        time: '48:00:00'
+        mem: 128G
+        cpus: 8
+        gpus: 1
+    train_fno3d_det_xcube:
+      DEMO_NUM: 97
+      config: configs/jhu3d/config_baseline_fno3d_det_xcube.yaml
+      sbatch:
+        time: '48:00:00'
+        mem: 128G
+        cpus: 8
+        gpus: 1
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # full-grid backbones fragment the allocator
+
+    DEMO_NUM=${DEMO_NUM}
+    LOG_FILE="$FRB_LOGS/${FRB_CASE}_${SLURM_JOB_ID}_DemoN${DEMO_NUM}.log"
+    echo "Job $SLURM_JOB_ID on $SLURM_NODELIST, python: $(which python)"
+    CUDA_VISIBLE_DEVICES=0 python -m methods.dmfgen.train         --RELOAD         --config ${CONFIG}         --Demo-Num $DEMO_NUM >> "$LOG_FILE" 2>&1
+    echo "exit status: $?"
+train_iclr_jhu_scale:
+  purpose: DMF-Gen spectral-penalty SM row trained on the 20-cube set (data/JHU_20cubes_plus_cube3.h5, download_jhtdb_scale).
+  sbatch:
+    time: '48:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=octahedral
+
+    DEMO_NUM=36
+    LOG_FILE="$FRB_LOGS/train_iclr_jhu_scale_${SLURM_JOB_ID}_DemoN${DEMO_NUM}.log"
+    echo "Job $SLURM_JOB_ID on $SLURM_NODELIST, python: $(which python)"
+    # Guard: a mismatched DEMO_NUM/save_dir once pointed this run at N29's frozen
+    # directory and overwrote its args.json. Refuse to start if the target already exists.
+    SD=$(grep -oP '^save_dir\s*:\s*"\K[^"]+' configs/jhu3d/config_iclr_jhu_scale.yaml)
+    if ls -d ${SD}_DemoN${DEMO_NUM}_* >/dev/null 2>&1; then
+      echo "ABORT: ${SD}_DemoN${DEMO_NUM}_* already exists; refusing to reuse a run dir" >&2
+      exit 1
+    fi
+    CUDA_VISIBLE_DEVICES=0 python -m methods.dmfgen.train --config configs/jhu3d/config_iclr_jhu_scale.yaml         --Demo-Num $DEMO_NUM >> "$LOG_FILE" 2>&1
+    echo "exit status: $?"
+train_baseline_lfm_xcube_aug:
+  purpose: Latent FM stage 1 (convolutional autoencoder, DemoN23).
+  sbatch:
+    time: '48:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=octahedral
+    STAGE=${LFM_STAGE:-1}
+    LOG_FILE="$FRB_LOGS/train_baseline_lfm_xcube_aug_stage${STAGE}_${SLURM_JOB_ID}.log"
+    CUDA_VISIBLE_DEVICES=0 python -m methods.train_generative \
+            --config $FRB_ROOT/configs/jhu3d/config_baseline_Gen_xcube_aug.yaml \
+            --training-stage $STAGE >> "$LOG_FILE" 2>&1
+    echo "exit status: $?"
+train_latent_fm_xcube_stage2:
+  purpose: Latent FM stage 2 (latent rectified flow, DemoN24) on the stage-1 autoencoder named in the config (latent_fm_params.stage2.stage1_checkpoint).
+  sbatch:
+    time: '24:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # stage1_checkpoint names the run of record; point it at your own stage-1 run.
+    # LFM_CKPT_WINDOW archives every 50th epoch over the last 500 of the 11,000 epochs.
+    set -euo pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export LFM_CKPT_WINDOW=10500:11000:50
+    CUDA_VISIBLE_DEVICES=0 python -m methods.train_generative \
+        --config $FRB_ROOT/configs/jhu3d/config_baseline_LatentFM_xcube_fixed.yaml \
+        --training-stage 2 >> "$FRB_LOGS/train_latent_fm_xcube_stage2_${SLURM_JOB_ID}.log" 2>&1
+train_senseiver_iclr:
+  purpose: Senseiver (6.42M) under the 19.5 h wall-clock budget; budget.pt is the reported checkpoint.
+  sbatch:
+    time: '21:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Senseiver, ICLR cross-cube JHU arm.  Post-fidelity-audit configuration.
+    #
+    # NOTE: no trailing `echo "exit status: $?"` -- SLURM records the real python
+    # exit code, so a crash reports FAILED rather than COMPLETED.
+
+    set -u
+    set -o pipefail
+
+    # Shared protocol
+    export JHU_SPLIT_MODE=block
+    export JHU_SPLIT_GAP=0
+    export JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export TQDM_DISABLE=1
+
+    # Wall-clock budget matched across baselines (~20 h on one H100), and ~10
+    # archived checkpoints across the final 5% for checkpoint-noise measurement.
+    export BASELINE_MAX_HOURS=${BASELINE_MAX_HOURS:-19.5}
+    export BASELINE_ARCHIVE_N=${BASELINE_ARCHIVE_N:-10}
+
+
+    ROOT=$FRB_ROOT
+    CFG=$ROOT/configs/jhu3d/config_baseline_Senseiver_iclr.yaml
+    LOG=$FRB_LOGS/train_senseiver_iclr_${SLURM_JOB_ID}.log
+    SRC_H5=$FRB_ROOT/data/JHU_4cubes_stride100.h5
+
+    # ---------------------------------------------------------------------------
+    # Stage the dataset onto node-local NVMe.
+    #
+    # One training epoch re-reads all 150 train snapshots = 4.7 GB, i.e. ~780 MB/s
+    # sustained off shared Lustre, and ~10 sibling jobs hit the same filesystem.
+    # That contention stalled an earlier run for >12 min at a stretch, which eats
+    # the wall-clock budget the comparison is supposed to hold fixed.  6.3 GB onto
+    # a 3.2 TB local disk removes the coupling entirely.  Falls back to the shared
+    # path if staging fails, so this can only help.
+    # ---------------------------------------------------------------------------
+    STAGE_DIR=/tmp/${USER}/jhu_${SLURM_JOB_ID}
+    RUN_CFG=$CFG
+    mkdir -p "$STAGE_DIR"
+    echo "[stage] copying $(du -h $SRC_H5 | cut -f1) to $STAGE_DIR ..." >> "$LOG"
+    if cp "$SRC_H5" "$STAGE_DIR/" 2>>"$LOG"; then
+      LOCAL_H5="$STAGE_DIR/$(basename $SRC_H5)"
+      if [ "$(stat -c %s "$LOCAL_H5")" = "$(stat -c %s "$SRC_H5")" ]; then
+        RUN_CFG=$STAGE_DIR/config_run.yaml
+        sed "s#^\( *data_path: \).*#\1\"$LOCAL_H5\"#" "$CFG" > "$RUN_CFG"
+        echo "[stage] OK -> $LOCAL_H5" >> "$LOG"
+        grep -n "data_path" "$RUN_CFG" >> "$LOG"
+      else
+        echo "[stage] SIZE MISMATCH, falling back to shared path" >> "$LOG"
+      fi
+    else
+      echo "[stage] copy FAILED, falling back to shared path" >> "$LOG"
+    fi
+
+    cleanup() { rm -rf "$STAGE_DIR"; }
+    trap cleanup EXIT
+
+    echo "config=$RUN_CFG budget=${BASELINE_MAX_HOURS}h" >> "$LOG"
+    CUDA_VISIBLE_DEVICES=0 python -u -m methods.train_deterministic --config "$RUN_CFG" >> "$LOG" 2>&1
+    status=$?
+    echo "python exit status: $status" >> "$LOG"
+    exit $status
+train_sit_xcube_matched:
+  purpose: SiT-point (6.57M), then its cost instrumentation on best.pt and last.pt.
+  sbatch:
+    time: '24:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    # Capacity-matched SiT-point: depth 6 x hidden 240 x 4 heads = 6,571,924 params
+    # (+1.01% of the 6,506,253-param comparison model). The older
+    # config_baseline_SiT_xcube.yaml (hidden 256) is 7,468,804 = +14.8%, outside
+    # the +/-10% band.
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # Measured: 12.85 -> 11.96 s/epoch (-6.9%). DataLoader workers are otherwise
+    # respawned every epoch. Node-local staging was measured and rejected: the H5
+    # reads at 1.27 GB/s and /tmp is no faster than Lustre here (5.9 s vs 5.9 s).
+    export JHU_PERSISTENT_WORKERS=1
+    CFGROOT=$FRB_ROOT/configs
+    LOG_FILE="$FRB_LOGS/train_sit_matched_${SLURM_JOB_ID}.log"
+    # NOTE: deliberately no trailing `echo "exit status: $?"` -- that pattern makes
+    # the batch script exit 0 and a crashed run reports COMPLETED to sacct.
+    CUDA_VISIBLE_DEVICES=0 python -m methods.train_generative \
+            --config $CFGROOT/jhu3d/config_baseline_SiT_xcube_matched.yaml \
+            --training-stage 1 >> "$LOG_FILE" 2>&1
+    RC=$?
+    echo "train rc=$RC" >> "$LOG_FILE"
+    if [ "$RC" -ne 0 ]; then exit "$RC"; fi
+
+    # Cost instrumentation on the run that was just produced (writes
+    # <run_dir>/instrumentation.json and prints greppable [instr] lines).
+    RUN=$(readlink -f "$(ls -d outputs/runs/JHU/baseline_sit/matched/Baseline_sit_Stage1_DemoN41_* | tail -1)")
+    echo "RUN=$RUN" >> "$LOG_FILE"
+    for CK in best last; do
+      python -m benchmarks.instrument_sit --run-dir "$RUN" --checkpoint $CK \
+        --out "$RUN/instrumentation_${CK}.json" >> "$LOG_FILE" 2>&1
+    done
+train_deeponet:
+  purpose: Set-DeepONet (DeepSets branch) under the 19.5 h budget; chains eval_deeponet on budget.pt and best.pt.
+  sbatch:
+    time: '21:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # DeepONet, ICLR cross-cube JHU arm.  Deterministic operator learner: plain
+    # MSE regression, no generative wrapper, K=1 at evaluation.
+    #
+    # NOTE: the launcher ends with an explicit `exit $status`, never a bare
+    # `echo "exit status: $?"` -- the latter forces exit 0 and a crash would be
+    # recorded as COMPLETED.
+
+    set -u
+    set -o pipefail
+
+    # Shared protocol
+    export JHU_SPLIT_MODE=block
+    export JHU_SPLIT_GAP=0
+    export JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # Compute-hours, not wall-clock, is the fleet's budget unit: wall-clock was
+    # found to measure filesystem and DataLoader luck rather than compute.  With
+    # the default (persistent_workers=False) PyTorch tears down and respawns the
+    # 4 worker processes EVERY epoch; measured on this arm that is ~3.5 s of a
+    # ~6.2 s epoch, i.e. a duty cycle of 0.33 against 0.87-0.99 for every other
+    # baseline -- a 2.7x compute handicap with no methodological content.
+    # JHU_PERSISTENT_WORKERS=1 (opt-in, baselines/model_baseline.py:4869) removes it and
+    # changes no other method's behaviour.
+    export JHU_PERSISTENT_WORKERS=1
+    export TQDM_DISABLE=1
+
+    # Wall-clock budget matched across baselines, plus ~10 archived checkpoints
+    # across the final 5% for checkpoint-noise measurement.  Both the archive
+    # window and the figure cadence are driven by MEASURED elapsed wall-clock,
+    # not by a projected epoch rate.
+    export BASELINE_MAX_HOURS=${BASELINE_MAX_HOURS:-19.5}
+    export BASELINE_ARCHIVE_N=${BASELINE_ARCHIVE_N:-10}
+
+
+    ROOT=$FRB_ROOT
+    CFG=$ROOT/configs/jhu3d/config_baseline_DeepONet_iclr.yaml
+    LOG=$FRB_LOGS/train_deeponet_${SLURM_JOB_ID}.log
+    SRC_H5=$FRB_ROOT/data/JHU_4cubes_stride100.h5
+
+    # Stage the dataset onto node-local NVMe (same rationale as the Senseiver arm:
+    # ~10 sibling jobs share Lustre and contention was measured to eat >50% of the
+    # wall-clock budget).  Falls back to the shared path if staging fails.
+    STAGE_DIR=/tmp/${USER}/jhu_${SLURM_JOB_ID}
+    RUN_CFG=$CFG
+    mkdir -p "$STAGE_DIR"
+    echo "[stage] copying $(du -h $SRC_H5 | cut -f1) to $STAGE_DIR ..." >> "$LOG"
+    if cp "$SRC_H5" "$STAGE_DIR/" 2>>"$LOG"; then
+      LOCAL_H5="$STAGE_DIR/$(basename $SRC_H5)"
+      if [ "$(stat -c %s "$LOCAL_H5")" = "$(stat -c %s "$SRC_H5")" ]; then
+        RUN_CFG=$STAGE_DIR/config_run.yaml
+        sed "s#^\( *data_path: \).*#\1\"$LOCAL_H5\"#" "$CFG" > "$RUN_CFG"
+        echo "[stage] OK -> $LOCAL_H5" >> "$LOG"
+      else
+        echo "[stage] SIZE MISMATCH, falling back to shared path" >> "$LOG"
+      fi
+    else
+      echo "[stage] copy FAILED, falling back to shared path" >> "$LOG"
+    fi
+    cleanup() { rm -rf "$STAGE_DIR"; }
+    trap cleanup EXIT
+
+    echo "config=$RUN_CFG budget=${BASELINE_MAX_HOURS}h" >> "$LOG"
+    CUDA_VISIBLE_DEVICES=0 python -u -m methods.deeponet.train --config "$RUN_CFG" >> "$LOG" 2>&1
+    status=$?
+    echo "python exit status: $status" >> "$LOG"
+
+    # Chain the two reported evaluations only if training really succeeded.
+    if [ "$status" -eq 0 ]; then
+      RUN_DIR=$(grep -m1 '^\[run\] dir=' "$LOG" | sed 's#^\[run\] dir=##')
+      echo "[chain] run_dir=$RUN_DIR" >> "$LOG"
+      # The staged config records the /tmp data path, which disappears with the
+      # node.  Rewrite the saved run_config.yaml back to the shared path so the
+      # evaluation job can open the dataset.
+      if [ -n "$RUN_DIR" ] && [ -f "$RUN_DIR/run_config.yaml" ]; then
+        sed -i "s#^\( *data_path: \).*#\1$SRC_H5#" "$RUN_DIR/run_config.yaml"
+        for CK in budget.pt best.pt; do
+          if [ -f "$RUN_DIR/$CK" ]; then
+            jid=$(frb_submit --parsable --export=ALL,RUN_DIR="$RUN_DIR",CKPT=$CK eval_deeponet)
+            echo "[chain] submitted eval $CK job=$jid" >> "$LOG"
+          else
+            echo "[chain] MISSING $RUN_DIR/$CK -- no eval submitted" >> "$LOG"
+          fi
+        done
+      fi
+    fi
+    exit $status
+train_deeponetpp:
+  purpose: Set-DeepONet++ (binned branch moments, random Fourier trunk; p = 640) with early stopping on the TUNE
+    half; chains eval_deeponetpp.
+  sbatch:
+    time: '21:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # DeepONet++ (structured branch), ICLR cross-cube JHU arm.  One script serves
+    # all p-sweep arms: pass CFG and TAG via --export.  Early stopping at the
+    # fixed-validation (TUNE odd cube-3, canonical seed-0 masks) optimum;
+    # BASELINE_MAX_HOURS=19.5 is the wall backstop.
+    #
+    # Chains, on success: canonical 50-snapshot evals (best.pt + budget.pt) and
+    # the TUNE-odd / TEST-even subset evals on best.pt.
+
+    set -u
+    set -o pipefail
+
+    export JHU_SPLIT_MODE=block
+    export JHU_SPLIT_GAP=0
+    export JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # Persistent workers: same measured rationale as the vanilla DeepONet arm
+    # (worker respawn was ~3.5 s of a ~6.2 s epoch = 2.7x compute handicap).
+    export JHU_PERSISTENT_WORKERS=1
+    export TQDM_DISABLE=1
+    export BASELINE_MAX_HOURS=${BASELINE_MAX_HOURS:-19.5}
+    export BASELINE_ARCHIVE_N=${BASELINE_ARCHIVE_N:-10}
+
+
+    TMPD=$FRB_LOGS
+    CFG=${CFG:-$FRB_ROOT/configs/jhu3d/config_baseline_DeepONetPP_iclr_p640.yaml}
+    TAG=${TAG:-_p640}
+    LOG=$TMPD/train_deeponetpp${TAG}_${SLURM_JOB_ID}.log
+    SRC_H5=$FRB_ROOT/data/JHU_4cubes_stride100.h5
+
+    # Stage the dataset onto node-local NVMe (same rationale as every other arm:
+    # sibling jobs share Lustre; contention measured to eat >50% of wall budget).
+    STAGE_DIR=/tmp/${USER}/jhu_${SLURM_JOB_ID}
+    RUN_CFG=$CFG
+    mkdir -p "$STAGE_DIR"
+    echo "[stage] copying $(du -h $SRC_H5 | cut -f1) to $STAGE_DIR ..." >> "$LOG"
+    if cp "$SRC_H5" "$STAGE_DIR/" 2>>"$LOG"; then
+      LOCAL_H5="$STAGE_DIR/$(basename $SRC_H5)"
+      if [ "$(stat -c %s "$LOCAL_H5")" = "$(stat -c %s "$SRC_H5")" ]; then
+        RUN_CFG=$STAGE_DIR/config_run.yaml
+        sed "s#^\( *data_path: \).*#\1\"$LOCAL_H5\"#" "$CFG" > "$RUN_CFG"
+        echo "[stage] OK -> $LOCAL_H5" >> "$LOG"
+      else
+        echo "[stage] SIZE MISMATCH, falling back to shared path" >> "$LOG"
+      fi
+    else
+      echo "[stage] copy FAILED, falling back to shared path" >> "$LOG"
+    fi
+    cleanup() { rm -rf "$STAGE_DIR"; }
+    trap cleanup EXIT
+
+    echo "config=$RUN_CFG tag=$TAG budget=${BASELINE_MAX_HOURS}h" >> "$LOG"
+    CUDA_VISIBLE_DEVICES=0 python -u -m methods.deeponet.trainpp \
+      --config "$RUN_CFG" --tag "$TAG" >> "$LOG" 2>&1
+    status=$?
+    echo "python exit status: $status" >> "$LOG"
+
+    # NAMED subset tokens, not comma lists: sbatch --export splits on commas and
+    # would truncate "1,3,5,..." to "1" (bug found 2026-08-30, jobs 17117990/91).
+    # eval_deeponetpp.py expands TUNE_ODD / TEST_EVEN itself.
+    TUNE_IDS=TUNE_ODD
+    TEST_IDS=TEST_EVEN
+
+    if [ "$status" -eq 0 ]; then
+      RUN_DIR=$(grep -m1 '^\[run\] dir=' "$LOG" | sed 's#^\[run\] dir=##')
+      echo "[chain] run_dir=$RUN_DIR" >> "$LOG"
+      # The staged config records the /tmp data path; rewrite the saved
+      # run_config.yaml back to the shared path for the evaluation jobs.
+      if [ -n "$RUN_DIR" ] && [ -f "$RUN_DIR/run_config.yaml" ]; then
+        sed -i "s#^\( *data_path: \).*#\1$SRC_H5#" "$RUN_DIR/run_config.yaml"
+        # canonical 50-snapshot rows, best + budget
+        for CK in best.pt budget.pt; do
+          if [ -f "$RUN_DIR/$CK" ]; then
+            jid=$(frb_submit --parsable \
+                  --export=ALL,RUN_DIR="$RUN_DIR",CKPT=$CK eval_deeponetpp)
+            echo "[chain] submitted canonical eval $CK job=$jid" >> "$LOG"
+          else
+            echo "[chain] MISSING $RUN_DIR/$CK -- no eval submitted" >> "$LOG"
+          fi
+        done
+        # TUNE (odd, selection evidence) and TEST (even, primary) subsets, best.pt
+        if [ -f "$RUN_DIR/best.pt" ]; then
+          jid=$(frb_submit --parsable --export=ALL,RUN_DIR="$RUN_DIR",CKPT=best.pt,NSNAP=25,SNAPIDS="$TUNE_IDS",LABEL=TUNE_odd,OUTNAME=iclr_protocol_eval_best_TUNEodd \
+                eval_deeponetpp)
+          echo "[chain] submitted TUNE-odd eval job=$jid" >> "$LOG"
+          jid=$(frb_submit --parsable --export=ALL,RUN_DIR="$RUN_DIR",CKPT=best.pt,NSNAP=25,SNAPIDS="$TEST_IDS",LABEL=TEST_even,OUTNAME=iclr_protocol_eval_best_TESTeven \
+                eval_deeponetpp)
+          echo "[chain] submitted TEST-even eval job=$jid" >> "$LOG"
+        fi
+      fi
+    fi
+    exit $status
+train_confild_unified:
+  purpose: CoNFiLD stage 1 (conditional neural field) then stage 2 (latent diffusion prior) in one allocation; argument
+    = config path under configs/ (published prior, capacity-matched, 384-d latent).
+  sbatch:
+    time: '23:00:00'
+    mem: 128G
+    cpus: 8
+    gpus: 1
+  body: |
+    #
+    # usage: python -m launch submit train_confild_unified jhu3d/config_baseline_CoNFiLD_published_prior_xcube.yaml   (path under configs/)
+    #
+    # Runs stage 1 then stage 2 in ONE allocation so the ~19.5 h wall-clock budget
+    # is a single matched budget across both stages. Per-stage cut-offs are in the
+    # YAML (stage1 13.5 h + stage2 5.5-6.0 h).
+    #
+    # NOTE: no trailing `echo "exit status: $?"` anywhere. That idiom forces exit 0
+    # and makes a crashed run report COMPLETED.
+
+    set -euo pipefail
+
+    REPO=$FRB_ROOT
+    CONFIG="${1:?usage: frb_submit train_confild_unified <config-basename>}"
+
+
+    export CUDA_VISIBLE_DEVICES=0
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export JHU_SPLIT_MODE=block
+    export JHU_SPLIT_GAP=0
+    export JHU_AUGMENT=octahedral
+    export MPLCONFIGDIR=/tmp
+    # One stamp for the whole allocation; run_stage re-stamps CONFILD_SLURM_START
+    # per stage so each stage's duty cycle uses its own denominator.
+    export CONFILD_JOB_START=$(date +%s)
+
+    echo "=== CoNFiLD unified run ==="
+    echo "job        : ${SLURM_JOB_ID}"
+    echo "config     : ${CONFIG}"
+    echo "node       : $(hostname)"
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+    # ---------------------------------------------------------------------------
+    # Stage the 5.9 GB HDF5 to node-local NVMe.
+    #
+    # The shared Lustre path is read by every job in the fleet at once; a sibling
+    # baseline measured a 45% duty cycle and a 13-minute stall against it. Our
+    # stage-1 hot loop is insulated (cache_snapshots preloads every snapshot into
+    # RAM once, measured 99.9% duty cycle inside the loop), but STARTUP still
+    # streams ~9.4 GB and all three arms start together, so they would contend with
+    # each other. Staging removes that coupling.
+    #
+    # Strictly best-effort: any failure -- no /tmp space, short copy, sed failure --
+    # falls back to the shared path, so this can only help.
+    # ---------------------------------------------------------------------------
+    CONFIG_PATH="configs/${CONFIG}"
+    RUN_CONFIG="$CONFIG_PATH"
+    SRC=$(awk '/^[[:space:]]*data_path:/ {print $2; exit}' "$CONFIG_PATH")
+    STAGE_DIR="/tmp/${USER}/jhu_${SLURM_JOB_ID}"
+    cleanup() { rm -rf "$STAGE_DIR" 2>/dev/null || true; }
+    trap cleanup EXIT
+
+    stage_ok=0
+    if [ -f "$SRC" ] && mkdir -p "$STAGE_DIR" 2>/dev/null; then
+      echo "staging    : $SRC -> $STAGE_DIR"
+      t0=$(date +%s)
+      if cp "$SRC" "$STAGE_DIR/" 2>/dev/null; then
+        LOCAL="$STAGE_DIR/$(basename "$SRC")"
+        src_sz=$(stat -c%s "$SRC" 2>/dev/null || echo 0)
+        dst_sz=$(stat -c%s "$LOCAL" 2>/dev/null || echo 1)
+        if [ "$src_sz" -gt 0 ] && [ "$src_sz" -eq "$dst_sz" ]; then
+          CAND="$STAGE_DIR/$(basename "$CONFIG_PATH")"
+          if sed "s|^\([[:space:]]*data_path:[[:space:]]*\).*|\1${LOCAL}|" "$CONFIG_PATH" > "$CAND" \
+             && grep -q "data_path:[[:space:]]*${LOCAL}" "$CAND"; then
+            RUN_CONFIG="$CAND"; stage_ok=1
+            echo "staging    : OK ($((src_sz/1024/1024)) MB in $(( $(date +%s) - t0 )) s)"
+          fi
+        fi
+      fi
+    fi
+    [ "$stage_ok" -eq 1 ] || echo "staging    : FALLBACK to shared path (staging unavailable or incomplete)"
+    echo "run config : $RUN_CONFIG"
+    echo "data_path  : $(awk '/^[[:space:]]*data_path:/ {print $2; exit}' "$RUN_CONFIG")"
+
+    run_stage () {
+      local stage=$1
+      echo "=== stage ${stage} ==="
+      local t0=$(date +%s)
+      export CONFILD_SLURM_START=$t0
+      python -m methods.train_generative --config "$RUN_CONFIG" --training-stage "$stage" --device cuda:0
+      echo "[confild:slurm] stage=${stage} slurm_stage_elapsed_s=$(( $(date +%s) - t0 )) staged=${stage_ok}"
+    }
+
+    run_stage 1
+    run_stage 2
+
+    echo "[confild:slurm] job_total_elapsed_s=$(( $(date +%s) - CONFILD_JOB_START )) staged=${stage_ok}"
+    echo "=== done ==="
+s3gm_train:
+  purpose: S3GM video-diffusion prior (6.35M; sigma_max 20, raw score output, the reported 3D prior). S3GM_CONFIG=configs/jhu3d/config_baseline_S3GM_xcube_sigmamax2270.yaml
+    trains the diverging sigma_max-rule variant of the SM.
+  sbatch:
+    time: '21:30:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    # S3GM baseline, JHU cross-cube. Capacity-matched: 6,348,228 trainable params
+    # (-2.43% of the 6,506,253-param comparison model).
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export MPLBACKEND=Agg
+    BASE=$FRB_ROOT
+    CFGROOT="$BASE/configs"
+    # Parameterised so a smoke run validates this exact staging code path.
+    CFG_IN="${S3GM_CONFIG:-$CFGROOT/jhu3d/config_baseline_S3GM_xcube.yaml}"
+    LOG="$FRB_LOGS/s3gm_train_${SLURM_JOB_ID}.log"
+
+    # ---------------------------------------------------------------------------
+    # Stage the H5 to node-local NVMe.
+    #
+    # TurbulentCombustionH5Dataset.__getitem__ reads the 5.9 GB H5 on EVERY access
+    # with no caching, so a 150-snapshot epoch moves ~4.7 GB. On a contended shared
+    # Lustre that turns the wall-clock budget into a function of who else is
+    # running, which breaks budget-matching as a controlled variable.
+    #
+    # Any failure falls back to the shared path -- staging is an optimisation, never
+    # a correctness dependency.
+    # ---------------------------------------------------------------------------
+    SHARED_H5=$(python - "$CFG_IN" <<'PY'
+    import sys, yaml
+    print(yaml.safe_load(open(sys.argv[1]))["shared"]["paths"]["data_path"])
+    PY
+    )
+    # Per-job $TMPDIR where the site sets one: Kestrel's /tmp is shared by every job on
+    # the node, and another job of the same user ending there deletes our staged copy.
+    STAGE_DIR="${TMPDIR:-/tmp/$USER}/jhu_${SLURM_JOB_ID}"
+    DATA_PATH="$SHARED_H5"
+    cleanup() { rm -rf "$STAGE_DIR" 2>/dev/null || true; }
+    trap cleanup EXIT
+
+    {
+      echo "[stage] shared source: $SHARED_H5"
+      SRC_SIZE=$(stat -L -c%s "$SHARED_H5" 2>/dev/null || echo 0)
+      if ! mkdir -p "$STAGE_DIR" 2>/dev/null; then
+        echo "[stage] cannot create $STAGE_DIR; FALLBACK to shared path"
+      elif [ "$SRC_SIZE" -le 0 ]; then
+        echo "[stage] source unreadable or empty; FALLBACK to shared path"
+      else
+        AVAIL=$(df -B1 --output=avail "$STAGE_DIR" 2>/dev/null | tail -1)
+        AVAIL=${AVAIL:-0}
+        NEED=$(( SRC_SIZE + 10737418240 ))          # source + 10 GB headroom
+        if [ "$AVAIL" -lt "$NEED" ]; then
+          echo "[stage] only ${AVAIL}B free, need ${NEED}B; FALLBACK to shared path"
+        else
+          T0=$SECONDS
+          if cp "$SHARED_H5" "$STAGE_DIR/data.h5" 2>/dev/null; then
+            DST_SIZE=$(stat -c%s "$STAGE_DIR/data.h5" 2>/dev/null || echo 0)
+            if [ "$DST_SIZE" -eq "$SRC_SIZE" ]; then
+              DATA_PATH="$STAGE_DIR/data.h5"
+              echo "[stage] OK: ${SRC_SIZE} bytes -> $DATA_PATH in $((SECONDS-T0))s"
+            else
+              echo "[stage] SIZE MISMATCH ($DST_SIZE != $SRC_SIZE); FALLBACK to shared path"
+              rm -f "$STAGE_DIR/data.h5"
+            fi
+          else
+            echo "[stage] copy FAILED; FALLBACK to shared path"
+          fi
+        fi
+      fi
+      echo "[stage] data_path in use: $DATA_PATH"
+    } >> "$LOG" 2>&1
+
+    # Job-local config: data_path -> staged copy, canonical path preserved as
+    # data_path_shared so eval_s3gm3d.py can fall back on another node.
+    CFG_JOB="$STAGE_DIR/config_s3gm_job.yaml"
+    if ! python - "$CFG_IN" "$CFG_JOB" "$DATA_PATH" "$SHARED_H5" >> "$LOG" 2>&1 <<'PY'
+    import sys, yaml
+    cfg_in, cfg_out, data_path, shared = sys.argv[1:5]
+    c = yaml.safe_load(open(cfg_in))
+    c["shared"]["paths"]["data_path"] = data_path
+    c["shared"]["paths"]["data_path_shared"] = shared
+    yaml.safe_dump(c, open(cfg_out, "w"), sort_keys=False)
+    print(f"[stage] wrote job config {cfg_out}")
+    PY
+    then
+      echo "[stage] job-config write FAILED; using the checked-in config unchanged" >> "$LOG"
+      CFG_JOB="$CFG_IN"
+    fi
+
+    # NOTE: deliberately no trailing `echo "exit status: $?"` -- that pattern makes
+    # the batch script exit 0 so a crashed run reports COMPLETED to sacct.
+    CUDA_VISIBLE_DEVICES=0 python -m methods.s3gm.train_jhu \
+        --config "$CFG_JOB" --training-stage 1 >> "$LOG" 2>&1
+    RC=$?
+    echo "train rc=$RC" >> "$LOG"
+
+    # Run-level duty cycle: summed GPU compute against SLURM elapsed.
+    python - "$LOG" "$SLURM_JOB_ID" >> "$LOG" 2>&1 <<'PY'
+    import re, subprocess, sys, json
+    log, job = sys.argv[1], sys.argv[2]
+    txt = open(log, errors="replace").read().replace("\r", "\n")
+    comp = [float(x) for x in re.findall(r"compute_s=([0-9.]+)", txt)]
+    data = [float(x) for x in re.findall(r"data_s=([0-9.]+)", txt)]
+    steps = [int(x) for x in re.findall(r"opt_steps_total=(\d+)", txt)]
+    el = subprocess.run(["sacct","-j",job,"--format=ElapsedRaw","-n","-P"],
+                        capture_output=True, text=True).stdout.split("\n")[0].strip()
+    el = float(el) if el.isdigit() else 0.0
+    tc, td = sum(comp), sum(data)
+    print(f"[duty] opt_steps={steps[-1] if steps else 0} compute_s={tc:.1f} "
+          f"loader_wait_s={td:.1f} slurm_elapsed_s={el:.1f} "
+          f"epoch_duty={tc/max(tc+td,1e-9):.3f} job_duty={tc/max(el,1e-9):.3f}")
+    PY
+
+    if [ "$RC" -ne 0 ]; then exit "$RC"; fi
+train_gen4turb_jhu:
+  purpose: Gen4Turb with the upstream network and loader on the 120^3 crop - shared symmetric velocity range, octahedral
+    augmentation, seed 2027, cosine decay over 4200 epochs (105k steps), a checkpoint every 10 epochs.
+  sbatch:
+    time: '24:00:00'
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Needs the upstream checkout (site key gen4turb_root) and the exported data (export_gen4turb_jhu).
+    # Writes <gen4turb_root>/3_flow_reconstruction/dm/models_uxuz_octa_s2027/. No held-out validation:
+    # the checkpoint is chosen on the TUNE half (eval_gen4turb_jhu, analysis.paired_ci_jhu).
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    nvidia-smi --query-gpu=name,memory.total --format=csv
+    python -u -m methods.gen4turb.train_jhu --run models_uxuz_octa_s2027 --epochs 4200 --save-every 10

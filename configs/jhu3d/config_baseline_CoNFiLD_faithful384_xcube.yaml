@@ -1,0 +1,117 @@
+# CoNFiLD (du2024confild, Nat. Commun. 2024) on the JHU cross-cube protocol.
+# Upstream compared against: github.com/jx-wang-s-group/CoNFiLD @ 449835e
+# (2025-02-19; last CODE change 1ae4f81, 2024-11-08). The SIREN auto-decoder and
+# the latent-diffusion UNet are imported verbatim from that checkout.
+#
+# ARM: F - faithful (384-scalar code, upstream case4 recipe)
+# The literal upstream recipe. Its bottleneck is 39x more aggressive relative to the data than anything upstream validated; arm C brackets it.
+#
+# Trainable parameters at inference: decoder 4,579,972 + UNet 2,038,337
+#   = 6,618,309  (+1.72% vs the 6,506,253-parameter comparison model).
+# Latent bottleneck: 384 scalars per snapshot. The comparison model carries a
+# 128 x 256 = 32,768-scalar global latent with NO compressive bottleneck, i.e.
+# 85x larger. That bottleneck is CoNFiLD's defining scientific claim, so it
+# is NOT equalised; the two arms bracket it instead.
+baseline_model: confild
+training_stage: 1
+
+shared:
+  demo_num: 23
+  seed: 42
+  device_ids: [0]
+  reload: false
+  paths:
+    data_path: data/JHU_4cubes_stride100.h5
+    save_root: outputs/runs/JHU/baseline_confild/unified_faithful384
+    config_backup_root: configs/backup/isotropic_turbulence/confild
+  data:
+    dataset_name: turbulent_combustion
+    train_ratio: 0.75
+    time_stride: 1
+    num_workers: 0
+    num_x: 125
+    num_y: 125
+    num_z: 125
+    field_names: [Ux, Uy, Uz, p]
+  conditioning:
+    cond_fields: [0, 2]
+    n_obs_min_list: [1953]
+    n_obs_max_list: [19531]
+    vis_cond_fields: [0, 2]
+    vis_n_obs_list: [19531]
+  logging:
+    eval_every: 10
+    save_every: 25
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+confild_params:
+  upstream_root: third_party/CoNFiLD
+  parameter_budget:
+    # The model the baselines are compared against, measured, not quoted.
+    comparison_model: 6506253
+    relative_tolerance: 0.10
+    enforce: true
+
+  stage1:
+    training:
+      # Upstream case4.yml runs 30,000 epochs. We run to a wall-clock budget
+      # instead; `epochs` is only an upper bound the budget cuts short.
+      epochs: 100000
+      wallclock_budget_s: 48600          # 13.5 h of the 20 h total
+      batch_size: 8
+      # Upstream feeds every point of every item once per epoch. At 1,953,125
+      # points x 7,200 items that is impossible, so each item contributes a
+      # uniform random subsample per epoch. The SIREN loss is pointwise, so this
+      # is an unbiased estimator of the same objective.
+      points_per_item: 16384
+      # Upstream case4.yml verbatim. Neither rate is batch-size dependent here:
+      # the decoder takes exactly one Adam step per epoch on the epoch-summed
+      # gradient (Adam is invariant to a constant gradient rescale), and each
+      # latent is touched exactly once per epoch whatever the batch size.
+      decoder_learning_rate: 1.0e-4
+      latent_learning_rate: 1.0e-5
+      diagnostic_every: 10
+      diagnostic_items: 8
+      diagnostic_points: 65536
+      save_every: 50
+      cache_snapshots: true
+    architecture:
+      # Faithful arm: upstream case4.yml verbatim (hidden_size 384 = NF
+      # hidden_features 384, 15 hidden layers), only out_features changes from
+      # 3 to 4 because JHU carries p alongside the velocity.
+      hidden_features: 384
+      latent_dim: 384
+      layers: 15
+      tie_latent_to_hidden: true
+    augmentation:
+      # Shared protocol: 48 signed axis permutations. Upstream has no
+      # augmentation, so this multiplies the auto-decoder latent table (and the
+      # length of an upstream "epoch") by 48.
+      groups: 48
+
+  stage2:
+    stage1_checkpoint:
+    training:
+      steps: 2000000
+      wallclock_budget_s: 19800          # 5.5 h; 19 h with stage 1, inside 20 h
+      batch_size: 8                      # upstream case4.yml
+      learning_rate: 5.0e-5              # upstream case4.yml
+      log_every: 200
+      save_every: 5000
+    architecture:
+      cube_length: 50
+      window_length: 32
+      window_stride: 1
+      model_image_size: 384
+      diffusion_steps: 1000              # upstream
+      num_channels: 32
+      num_res_blocks: 2
+      num_heads: 4
+      num_head_channels: -1
+      attention_resolutions: "32,16,8"   # upstream string, verbatim
+      channel_mult: "1,1,1,1,2,2"
+      ema: 0.9999                        # upstream

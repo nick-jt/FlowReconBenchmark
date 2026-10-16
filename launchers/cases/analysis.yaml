@@ -1,0 +1,240 @@
+# Diagnostics and provenance numbers cited in the text, native-dataset reproductions of S3GM, CoNFiLD and Gen4Turb, and the cost and memory-scaling benchmarks.
+# python -m launch submit <case> [--variant <name>]; python -m launch list analysis
+
+diagnostics:
+  purpose: CPU - classical diagnostics table (IDW structure-function predictor, POD energy and conditioning), Kolmogorov
+    neighbour-frame and lattice-layout numbers, autoencoder ceilings, kinematic oracle, Kolmogorov frame autocorrelation,
+    2D S3GM rescore summary.
+  sbatch:
+    time: 04:00:00
+    mem: 160G
+    cpus: 64
+    gpus: 0
+  body: |
+    set -u
+    export PYTHONDONTWRITEBYTECODE=1
+    mkdir -p outputs/paper/figures outputs/paper/diagnostics
+    RC=0
+    run () { echo "##### $*"; /usr/bin/time -f "[time] %e s, %M KB" python -u -m "$@" || RC=1; }
+    for R in kolmogorov cylinder jhu; do run analysis.diagnostics.idw_diag $R; done   # one regime per process (shared RNG)
+    run analysis.diagnostics.idw_diag_local
+    run analysis.diagnostics.idw_build
+    run analysis.diagnostics.pod_diag_2d cylinder cylinder_surface kolmogorov
+    run analysis.diagnostics.pod_diag_jhu
+    run analysis.diagnostics.pod_dense_limit cylinder 20
+    run analysis.diagnostics.pod_dense_limit jhu 80
+    run analysis.diagnostics.pod_build
+    run analysis.kolm_neighbor_frames
+    run analysis.kolm_layout_idw
+    run figures.pof.kolm_autocorr
+    run spectra.ae_ceiling_kolm
+    run spectra.ae_ceiling_jhu --ae "$(ls -d outputs/runs/JHU/baseline_latent_fm/Baseline_latent_fm_Stage1_DemoN23_* | tail -1)/best.pt"
+    run analysis.kinematic_oracle_jhu
+    python -I src/analysis/diagnostics/s3gm_rescore_2d.py || RC=1
+    echo "exit $RC"; exit $RC
+native_s3gm:
+  purpose: Released S3GM kol_v0 weights on the native Kolmogorov test set (Li et al. 2024, Fig. 3c) - upstream sampler
+    against our 3D and 2D ports (env MODES, SEEDS, FACTORS). Downloads (Zenodo 13925732) in data/native_repro/s3gm/download.
+  sbatch:
+    time: 02:00:00
+    mem: 60G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export TQDM_DISABLE=1
+    mkdir -p outputs/paper/diagnostics
+    nvidia-smi --query-gpu=name,memory.total --format=csv
+    RC=0
+    for SEED in ${SEEDS:-123}; do
+      python -I -u src/analysis/diagnostics/native_s3gm.py --root data/native_repro/s3gm/download \
+        --modes ${MODES:-nets upstream port port2d} --factors ${FACTORS:-8 4} --seed $SEED || RC=1
+    done
+    exit $RC
+native_confild:
+  purpose: Released CoNFiLD Case-4 weights on the native sensor task - upstream notebook path against our port,
+    10 samples per arm, one array task per arm. Run `native_confild.py fetch` and `prep` on a login node first (data/native_repro/confild).
+  sbatch:
+    time: 01:00:00
+    mem: 40G
+    cpus: 8
+    gpus: 1
+    array: 0-7
+  body: |
+    set -u
+    export TQDM_DISABLE=1 MPLCONFIGDIR=/tmp
+    N=data/native_repro/confild
+    ARMS=("upstream 100" "port 100" "upstream 10" "upstream 1" "uncond 1" "port 10" "port 1" "cnf 100")
+    read -r ARM S <<< "${ARMS[$SLURM_ARRAY_TASK_ID]}"
+    nvidia-smi --query-gpu=name,memory.total --format=csv
+    python -I -u src/analysis/diagnostics/native_confild.py run --path $ARM --sensors $S \
+      --samples ${SAMPLES:-10} --data $N/download --ckpt $N/port_ckpt --out outputs/native_repro/confild
+native_confild_rescore:
+  purpose: Re-scores every saved native CoNFiLD draw from its latents (adds the un-normalized |u| MSE).
+  sbatch:
+    time: 00:40:00
+    mem: 40G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export TQDM_DISABLE=1 MPLCONFIGDIR=/tmp
+    python -I -u src/analysis/diagnostics/native_confild.py rescore --data data/native_repro/confild/download \
+      --out outputs/native_repro/confild
+native_gen4turb:
+  purpose: Released Gen4Turb DM on its native cylinder-wake test frames - upstream Test Setup 1 against our JHTDB
+    evaluation path, per channel. Run `native_gen4turb.py fetch` on a login node first (data/native_repro/gen4turb).
+  sbatch:
+    time: 01:00:00
+    mem: 120G
+    cpus: 16
+    gpus: 1
+  body: |
+    set -u
+    export TQDM_DISABLE=1
+    G4T=$(python -c "from paths import site_path; print(site_path('gen4turb_root'))")
+    mkdir -p outputs/native_repro/gen4turb
+    nvidia-smi --query-gpu=name,memory.total --format=csv
+    python -I -u src/analysis/diagnostics/native_gen4turb.py run --data data/native_repro/gen4turb/download \
+      --upstream "$G4T" --out outputs/native_repro/gen4turb/native_gen4turb_run.json
+native_summaries:
+  purpose: CPU - summary JSONs of the CoNFiLD and Gen4Turb native reproductions (outputs/paper/diagnostics/native_*.json).
+  sbatch:
+    time: 00:30:00
+    mem: 32G
+    cpus: 4
+    gpus: 0
+  body: |
+    set -u
+    mkdir -p outputs/paper/diagnostics
+    RC=0
+    python -I -u src/analysis/diagnostics/native_confild.py summary --data data/native_repro/confild/download \
+      --out outputs/native_repro/confild --json outputs/paper/diagnostics/native_confild.json || RC=1
+    python -I -u src/analysis/diagnostics/native_gen4turb.py summary --data data/native_repro/gen4turb/download \
+      --run outputs/native_repro/gen4turb/native_gen4turb_run.json --json outputs/paper/diagnostics/native_gen4turb.json || RC=1
+    exit $RC
+bench_dmfgen_cost:
+  purpose: DMF-Gen (N15, last.pt) inference time per 125^3 field after two untimed warm-up calls (KeOps compile),
+    median of three, NFE 2 and 4.
+  sbatch:
+    time: 00:45:00
+    mem: 128G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    RD=$(ls -d outputs/runs/JHU/pointcloud_ffm/iclr_jhu_xcube_aug_DemoN15_* | tail -1)
+    nvidia-smi --query-gpu=name --format=csv,noheader
+    RC=0
+    for N in 2 4; do
+      python -u -m benchmarks.benchmark_cost --mode scale --run-dir $RD --ckpt last.pt --resolutions 125 \
+        --n-steps $N --warmup 2 --iters 3 --out outputs/rescore_jhu/dmfgen_N15_cost_scale_nfe${N}_warm.json || RC=1
+    done
+    echo "exit $RC"; exit $RC
+bench_fno3d_cost:
+  purpose: Data-resident FNO3D / FNO3D-FM step and inference timing (env RD, default the FNO3D-FM run).
+  sbatch:
+    time: 01:00:00
+    mem: 128G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    RD=${RD:-$(ls -d outputs/runs/JHU/baseline_fno/fno3d_xcube_DemoN90_* | tail -1)}
+    python -u -m benchmarks.bench_fno3d --run-dir "$RD" --ckpt best.pt --nfe 4 \
+      --batch-size 8 --out "$RD/cost_instrumentation.json"
+instr_sit:
+  purpose: SiT-point cost instrumentation of one run (env SIT_RUN), best.pt and last.pt; train_sit_xcube_matched
+    runs it at the end of training.
+  sbatch:
+    time: '2:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    RUN=${SIT_RUN:?set SIT_RUN to the run dir}
+    L=$FRB_LOGS/instr_sit_${SLURM_JOB_ID}.log
+    echo "RUN=$RUN" >> $L
+    for CK in best last; do
+      echo "##### checkpoint=$CK" >> $L
+      python -m benchmarks.instrument_sit --run-dir "$RUN" --checkpoint $CK \
+        --out "$RUN/instrumentation_${CK}.json" >> $L 2>&1
+      RC=$?
+      echo "rc=$RC for $CK" >> $L
+    done
+run_scaling_bench:
+  purpose: Memory and time scaling to 1024^3 - DMF-Gen inference and training step, convolutional-autoencoder inference
+    and training step (scaling figure).
+  sbatch:
+    time: '5:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    N29=outputs/runs/JHU/pointcloud_ffm/iclr_jhu_xcube_spec02_DemoN29_20260822_140100
+    OUT=$N29/Evaluation
+    mkdir -p $OUT
+    L=$FRB_LOGS/scaling_bench_${SLURM_JOB_ID}.log
+    # Our full-field inference, NFE=2 (rectified-flow operating point), ODE cache on.
+    python -m benchmarks.benchmark_cost --mode scale --run-dir $N29 \
+        --resolutions 64 125 192 256 384 512 768 1024 \
+        --n-steps 2 --out $OUT/scaling_ours_infer.json >> $L 2>&1
+    # ConvAE3D inference (encode+decode) — lower bound on latent-FM sampling cost.
+    python -m benchmarks.benchmark_cost --mode grid \
+        --resolutions 64 125 192 256 384 512 768 1024 \
+        --out $OUT/scaling_convae_infer.json >> $L 2>&1
+    # ConvAE3D TRAINING step (stage-1 lower bound), batch 1 (generous).
+    python -m benchmarks.benchmark_cost --mode grid_train --iters 5 \
+        --resolutions 64 125 192 256 320 384 512 \
+        --out $OUT/scaling_convae_train.json >> $L 2>&1
+    # Our training step vs dataset resolution (flat by construction; measured).
+    python -m benchmarks.benchmark_cost --mode train_scale --run-dir $N29 \
+        --resolutions 64 125 256 512 1024 --iters 5 \
+        --out $OUT/scaling_ours_train.json >> $L 2>&1
+    echo "ALL DONE" >> $L
+run_scaling_fixup:
+  purpose: Scaling figure - autoencoder inference re-timed with warm-up, and the measured autoencoder training memory
+    wall at 640^3 and 768^3.
+  sbatch:
+    time: 0:30:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    OUT=outputs/runs/JHU/pointcloud_ffm/iclr_jhu_xcube_spec02_DemoN29_20260822_140100/Evaluation
+    L=$FRB_LOGS/scaling_fixup_${SLURM_JOB_ID}.log
+    # Re-time ConvAE inference with warmup (memory unchanged)
+    python -m benchmarks.benchmark_cost --mode grid \
+        --resolutions 64 125 192 256 384 512 768 1024 \
+        --out $OUT/scaling_convae_infer.json >> $L 2>&1
+    # Measure (not extrapolate) the ConvAE training wall
+    python -m benchmarks.benchmark_cost --mode grid_train --iters 3 \
+        --resolutions 640 768 \
+        --out $OUT/scaling_convae_train_wall.json >> $L 2>&1
+    echo "ALL DONE" >> $L
+run_scaling_baselines:
+  purpose: Scaling figure - Senseiver and Gen4Turb memory and time against resolution.
+  sbatch:
+    time: '4:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    OUT=outputs/runs/JHU/pointcloud_ffm/iclr_jhu_xcube_spec02_DemoN29_20260822_140100/Evaluation
+    L=$FRB_LOGS/scaling_baselines_${SLURM_JOB_ID}.log
+    python -m benchmarks.benchmark_scaling_baselines --mode senseiver \
+        --resolutions 64 125 192 256 384 512 768 1024 \
+        --out $OUT/scaling_senseiver.json >> $L 2>&1
+    python -m benchmarks.benchmark_scaling_baselines --mode gen4turb \
+        --resolutions 64 120 128 192 256 320 384 512 \
+        --out $OUT/scaling_gen4turb.json >> $L 2>&1
+    echo "ALL DONE" >> $L

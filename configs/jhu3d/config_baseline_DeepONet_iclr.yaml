@@ -1,0 +1,92 @@
+# =============================================================================
+# DeepONet -- ICLR cross-cube JHU arm.
+#
+# Upstream: Lu et al., Nat Mach Intell 3:218-229 (2021).
+#   lululxvi/deepxde  @ 99b6620386d18cefb1549dddb7b7fe468cfad607
+#   lululxvi/deeponet @ 8d62345afd39e1df9c2c8c8d0e7c41882b06a9bf
+#
+# Shared protocol (identical for every baseline):
+#   data     JHU_4cubes_stride100.h5, 125^3, fields (Ux,Uy,Uz,p)
+#   split    JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0, train_ratio 0.75
+#            -> train = 150 snapshots (cubes 0-2), val = 50 (cube 3)
+#   augment  JHU_AUGMENT=octahedral (train only)
+#   sensors  per-channel independent masks on Ux (0) and Uz (2) only,
+#            uniform torch.randint over 1953..19531 = 0.1%..1% of 1,953,125
+#   stats    per-field standardisation from the TRAIN split only
+#
+# DeepONet is natively a DETERMINISTIC operator learner.  It is trained and
+# evaluated deterministically: K=1, fair CRPS reduces exactly to MAE, and no
+# spread or coverage metric applies.
+# =============================================================================
+
+baseline_model: "deeponet"
+training_stage: 1
+
+shared:
+  demo_num: 60
+  seed: 42
+  device_ids: [0]
+  reload: false                # never resume; a fresh run dir every launch
+
+  paths:
+    data_path: "data/JHU_4cubes_stride100.h5"
+    save_root: "outputs/runs/JHU/baseline_deeponet"
+    config_backup_root: "configs/backup/isotropic_turbulence/det_baseline"
+
+  data:
+    dataset_name: "turbulent_combustion"
+    train_ratio: 0.75
+    time_stride: 1
+    num_workers: 4
+    num_x: 125
+    num_y: 125
+    num_z: 125
+    field_names: [Ux, Uy, Uz, p]
+
+  conditioning:
+    cond_fields: [0, 2]          # Ux and Uz observed; Uy and p fully unobserved
+    n_obs_min_list: [1953]       # 0.1% of 1,953,125, broadcast to both fields
+    n_obs_max_list: [19531]      # 1.0%
+    vis_cond_fields: [0, 2]
+    vis_n_obs_list: [19531, 19531]
+
+  logging:
+    eval_every: 5
+    # Reconstruction figures are emitted on a WALL-CLOCK cadence, not an epoch
+    # cadence, so the target count is met whatever the measured epoch rate
+    # turns out to be.  budget / n_figures seconds between figures.
+    n_figures: 30
+
+deeponet_params:
+  training:
+    # Terminated by the BASELINE_MAX_HOURS wall-clock budget, which writes
+    # budget.pt; best.pt is the validation-selected checkpoint.
+    epochs: 2000000
+    batch_size: 20               # same as the Senseiver arm: 8 steps/epoch
+    # Upstream deeponet_pde.py:259 + :168 -- plain Adam, lr 1e-3, constant,
+    # no weight decay, no schedule, no gradient clipping.
+    learning_rate: 1.0e-3
+    weight_decay: 0.0
+    grad_clip:                   # null = upstream (deepxde applies none)
+    grad_norm_log_every: 25      # measure-only, written to grad_norm_history.json
+    eval_every: 5
+    n_query_points: 19531        # queries per snapshot per step (1% of the grid)
+
+  architecture:
+    # ---- parameter matching --------------------------------------------
+    # 6,505,732 trainable parameters = -0.008% of the 6,506,253 of the model
+    # these baselines are compared against.  Upstream's own hyper-parameters
+    # ([m,40,40] branch, [dim_x,40,40] trunk) would be ~8k parameters.
+    n_fields: 4
+    coord_dim: 3
+    p: 768                       # inner-product latent; per-channel basis rank
+    branch_width: 736
+    branch_phi_layers: 3         # per-sensor FNN before the mean-pool
+    branch_rho_layers: 2         # FNN after the pool; last layer LINEAR
+    trunk_width: 960             # caps the basis rank at min(p, trunk_width)
+    trunk_layers: 4              # 3 hidden + output; output is ACTIVATED
+    field_embed_dim: 32          # OUR ADAPTATION: per-channel independent
+                                 # masks mean each sensor carries one scalar
+                                 # plus a tag naming its field.
+    # Bottleneck = n_fields * p = 3,072 scalars for a 7,812,500-value field
+    # (2,543x compression).  This is the ONLY path from sensors to prediction.

@@ -1,0 +1,245 @@
+# Training of the 2D rows (cylinder volume and surface tasks, Kolmogorov), headline runs and seed replicates.
+# python -m launch submit <case> [--variant <name>]; python -m launch list 2d/train
+
+submit_2d_fleet:
+  purpose: Driver - submits every reported 2D training run (Kolmogorov and/or cylinder) behind its smoke gate, optionally
+    with the seed replicates.
+  sbatch:
+    time: 00:10:00
+    mem: 4G
+    cpus: 1
+    gpus: 0
+  body: |
+    # Submit the 2D learned fleet under the frozen protocol, gated on the smoke jobs.
+    #     python -m launch run submit_2d_fleet [kolm|cyl|all]   (default all)
+    # Env: SMOKE=0 skips the gate (SMOKE_PARTITION=<p> runs it on a short partition);
+    # SEEDS="7 1337" also submits the seed replicates (configs/<ds>_seed<S>/, written by
+    # tools.seed_replicates); HEADLINE=0 submits only the replicates; WALL (default
+    # 1-00:00:00) is the per-job wall.
+    # Rows: Senseiver, MLP-RBF (three rbf_sigma values, chosen on TUNE), FNO / mesh Geo-FNO,
+    # SiT-point; on Kolmogorov latent FM (stage 1 -> 2), S3GM and the upstream-code DMF-Gen;
+    # on the cylinder DMF-Gen (batch 128) and its upstream-recipe variant; classical anchors.
+    # Seed replicates: the deterministic rows everywhere, latent FM and S3GM on Kolmogorov.
+    set -euo pipefail
+    WHICH=${1:-all}
+    SMOKE=${SMOKE:-1}
+    SEEDS=${SEEDS:-}
+    HEADLINE=${HEADLINE:-1}
+    WALL=${WALL:-1-00:00:00}
+    MAP=$FRB_LOGS/fleet_jobs.txt
+    sub() {  # sub <label> <frb_submit args...>
+      local label=$1; shift
+      local jid
+      jid=$(frb_submit --parsable "$@")
+      echo "$(date +%F_%T) $label $jid" | tee -a "$MAP"
+      echo "$jid"
+    }
+    dep() { [ -n "${1:-}" ] && echo "--dependency=afterok:$1" || true; }
+    det() { echo "--export=ALL,TRAINER=methods.train_deterministic,CONFIG=$1"; }
+    gen() { echo "--export=ALL,TRAINER=methods.train_generative,CONFIG=$1"; }
+    smoke() { sub "$1" ${SMOKE_PARTITION:+-p $SMOKE_PARTITION} "$1" | tail -1; }
+
+    submit_kolm() {  # submit_kolm <config dir> <label prefix> <seed suffix> <dependency>
+      local C=$1 P=$2 S=$3 D=$4
+      sub ${P}_senseiver   $D -t $WALL $(det $C/config_baseline_Det_kolm$S.yaml)        train_kolm_baseline
+      sub ${P}_mlp_rbf     $D -t $WALL $(det $C/config_baseline_MLPRBF_kolm${S:+_sig002}$S.yaml)     train_kolm_baseline
+      sub ${P}_fno         $D -t $WALL $(det $C/config_baseline_GeoFNO_kolm$S.yaml)     train_kolm_baseline
+      if [ -z "$S" ]; then
+        sub ${P}_sit       $D -t $WALL $(gen $C/config_baseline_SiT_kolm_point.yaml)    train_kolm_baseline
+      fi
+      sub ${P}_s3gm        $D -t $WALL $(gen $C/config_baseline_S3GM_kolm$S.yaml)       train_kolm_baseline
+      local S1; S1=$(sub ${P}_lfm_s1 $D -t $WALL $(gen $C/config_baseline_Gen_kolm$S.yaml),LFM_STAGE=1 train_kolm_baseline | tail -1)
+      sub ${P}_lfm_s2      --dependency=afterok:$S1 -t $WALL $(gen $C/config_baseline_Gen_kolm$S.yaml),LFM_STAGE=2 train_kolm_baseline
+    }
+    submit_cyl() {  # submit_cyl <config dir> <label prefix> <seed suffix> <dependency>
+      local C=$1 P=$2 S=$3 D=$4
+      sub ${P}_senseiver   $D -t $WALL $(det $C/config_baseline_Det_cyl$S.yaml)         train_cyl_baseline
+      sub ${P}_mlp_rbf     $D -t $WALL $(det $C/config_baseline_MLPRBF_cyl${S:+_sig002}$S.yaml)      train_cyl_baseline
+      sub ${P}_geofno      $D -t $WALL $(det $C/config_baseline_GeoFNO_cyl_mesh$S.yaml) train_cyl_baseline
+      if [ -z "$S" ]; then
+        sub ${P}_sit       $D -t $WALL $(gen $C/config_baseline_SiT_cyl_point.yaml)     train_cyl_baseline
+        sub ${P}_dmfgen    $D -t $WALL --export=ALL,CONFIG=$C/config_bench_cyl_ffm_b128.yaml,DEMO_NUM=122 train_bench_cyl_ffm
+      fi
+    }
+
+    if [[ $WHICH == kolm || $WHICH == all ]]; then
+      SK=""; if [ "$SMOKE" = 1 ]; then SK=$(smoke smoke_kolm2d); fi
+      D=$(dep "$SK")
+      if [ "$HEADLINE" = 1 ]; then
+        submit_kolm configs/kolmogorov2d kolm "" "$D"
+        sub kolm_mlp_sig002  $D -t $WALL $(det configs/kolmogorov2d/config_baseline_MLPRBF_kolm_sig002.yaml) train_kolm_baseline
+        sub kolm_mlp_sig01   $D -t $WALL $(det configs/kolmogorov2d/config_baseline_MLPRBF_kolm_sig01.yaml)  train_kolm_baseline
+        sub kolm_dmfgen_cq   $D train_kolm_dmfgen_cq
+        sub kolm_classical   $D run_classical_kolm
+      fi
+      for SEED in $SEEDS; do
+        submit_kolm configs/kolmogorov2d_seed$SEED kolm_s$SEED _s$SEED "$D"
+      done
+    fi
+
+    if [[ $WHICH == cyl || $WHICH == all ]]; then
+      SC=""; if [ "$SMOKE" = 1 ]; then SC=$(smoke smoke_cyl2d); fi
+      D=$(dep "$SC")
+      if [ "$HEADLINE" = 1 ]; then
+        submit_cyl configs/cylinder2d cyl "" "$D"
+        sub cyl_dmfgen_up    $D -t $WALL --export=ALL,CONFIG=configs/cylinder2d/config_bench_cyl_ffm_upstream.yaml,DEMO_NUM=112 train_bench_cyl_ffm   # labelled variant (SM)
+        sub cyl_mlp_sig002   $D -t $WALL $(det configs/cylinder2d/config_baseline_MLPRBF_cyl_sig002.yaml) train_cyl_baseline
+        sub cyl_mlp_sig01    $D -t $WALL $(det configs/cylinder2d/config_baseline_MLPRBF_cyl_sig01.yaml)  train_cyl_baseline
+        sub cyl_classical    $D run_classical_cyl
+      fi
+      for SEED in $SEEDS; do
+        submit_cyl configs/cylinder2d_seed$SEED cyl_s$SEED _s$SEED "$D"
+      done
+    fi
+    echo "queue:"; squeue -u "$USER" -o "%.10i %.16j %.8T %.10M %.20E" | head -60
+submit_cyl_surface_fleet:
+  purpose: Driver - submits the reported surface-task training runs (taps on the wall ring) behind smoke_cyl_surface,
+    plus the classical anchors.
+  sbatch:
+    time: 00:10:00
+    mem: 4G
+    cpus: 1
+    gpus: 0
+  body: |
+    # Cylinder surface-to-field fleet:
+    #     python -m launch run submit_cyl_surface_fleet        # SMOKE=0 skips the gate
+    # Same trainers as the volume fleet; the configs set sensor_pool: surface,
+    # cond_fields [0,1,2] and the tap range. Runs land in outputs/runs/cylinder2d_surface/.
+    set -euo pipefail
+    SMOKE=${SMOKE:-1}
+    WALL=${WALL:-1-00:00:00}
+    MAP=$FRB_LOGS/fleet_jobs.txt
+    sub() { local label=$1; shift; local jid; jid=$(frb_submit --parsable "$@"); echo "$(date +%F_%T) $label $jid" | tee -a "$MAP"; echo "$jid"; }
+    dep() { [ -n "${1:-}" ] && echo "--dependency=afterok:$1" || true; }
+    C=configs/cylinder2d_surface
+    SK=""; if [ "$SMOKE" = 1 ]; then SK=$(sub smoke_cylsurf ${SMOKE_PARTITION:+-p $SMOKE_PARTITION} smoke_cyl_surface | tail -1); fi
+    D=$(dep "$SK")
+    sub cylsurf_dmfgen     $D -t $WALL --export=ALL,CONFIG=$C/config_bench_cyl_surface_ffm_b128.yaml,DEMO_NUM=123 train_bench_cyl_ffm
+    sub cylsurf_senseiver  $D -t $WALL --export=ALL,TRAINER=methods.train_deterministic,CONFIG=$C/config_baseline_Det_cyl_surface.yaml           train_cyl_baseline
+    sub cylsurf_mlp_rbf    $D -t $WALL --export=ALL,TRAINER=methods.train_deterministic,CONFIG=$C/config_baseline_MLPRBF_cyl_surface_sig002.yaml train_cyl_baseline
+    sub cylsurf_geofno     $D -t $WALL --export=ALL,TRAINER=methods.train_deterministic,CONFIG=$C/config_baseline_GeoFNO_cyl_surface_mesh.yaml   train_cyl_baseline
+    sub cylsurf_sit        $D -t $WALL --export=ALL,TRAINER=methods.train_generative,CONFIG=$C/config_baseline_SiT_cyl_surface_point.yaml      train_cyl_baseline
+    sub cylsurf_classical  $D run_classical_cyl_surface
+    echo "queue:"; squeue -u "$USER" -o "%.10i %.16j %.8T %.10M %.20E" | grep -i 'cylsurf\|classical' | head -20
+train_kolm_baseline:
+  purpose: One Kolmogorov training run - env TRAINER (methods.train_deterministic | train_generative), CONFIG, LFM_STAGE
+    (latent FM only).
+  sbatch:
+    time: '12:00:00'
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Generic 2D-Kolmogorov baseline launcher.
+    # env: TRAINER (methods.train_deterministic | methods.train_generative),
+    #      CONFIG (path relative to repo root), LFM_STAGE (Gen only, default 1)
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+
+    TRAINER=${TRAINER:-methods.train_deterministic}
+    CONFIG=${CONFIG:?set CONFIG=configs/kolmogorov2d/...yaml}
+    STAGE=${LFM_STAGE:-1}
+    TAG=$(basename "$CONFIG" .yaml)
+    LOG_FILE="$FRB_LOGS/train_kolm_${TAG}_stage${STAGE}_${SLURM_JOB_ID}.log"
+    echo "Job $SLURM_JOB_ID on $SLURM_NODELIST trainer=$TRAINER config=$CONFIG stage=$STAGE"
+
+    if [[ "$TRAINER" == "methods.train_generative" ]]; then
+        CUDA_VISIBLE_DEVICES=0 python -m $TRAINER --config "$CONFIG" \
+            --training-stage "$STAGE" >> "$LOG_FILE" 2>&1
+    else
+        CUDA_VISIBLE_DEVICES=0 python -m $TRAINER --config "$CONFIG" >> "$LOG_FILE" 2>&1
+    fi
+    echo "exit status: $?"
+train_cyl_baseline:
+  purpose: One cylinder training run (volume or surface task) - env TRAINER, CONFIG, LFM_STAGE.
+  sbatch:
+    time: '12:00:00'
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Generic 2D-cylinder baseline launcher.
+    # env: TRAINER (methods.train_deterministic | methods.train_generative),
+    #      CONFIG (path relative to repo root), LFM_STAGE (Gen only, default 1)
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+
+    TRAINER=${TRAINER:-methods.train_deterministic}
+    CONFIG=${CONFIG:?set CONFIG=configs/cylinder2d/...yaml}
+    STAGE=${LFM_STAGE:-1}
+    TAG=$(basename "$CONFIG" .yaml)
+    LOG_FILE="$FRB_LOGS/train_cyl_${TAG}_stage${STAGE}_${SLURM_JOB_ID}.log"
+    echo "Job $SLURM_JOB_ID on $SLURM_NODELIST trainer=$TRAINER config=$CONFIG stage=$STAGE"
+
+    if [[ "$TRAINER" == "methods.train_generative" ]]; then
+        CUDA_VISIBLE_DEVICES=0 python -m $TRAINER --config "$CONFIG" \
+            --training-stage "$STAGE" >> "$LOG_FILE" 2>&1
+    else
+        CUDA_VISIBLE_DEVICES=0 python -m $TRAINER --config "$CONFIG" >> "$LOG_FILE" 2>&1
+    fi
+    echo "exit status: $?"
+train_bench_cyl_ffm:
+  purpose: One cylinder DMF-Gen run - env CONFIG (default the batch-128 volume config), DEMO_NUM.
+  sbatch:
+    time: 06:00:00
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    # Re-holdout protocol: frames grouped train-Re-first in the H5
+    # ([0,1200)=Re{60,100,150,200}, [1200,1800)=Re{80,250}), so a gapless block
+    # split at train_ratio 0.6667 = the 4/2 Reynolds-number holdout.
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+
+    # env overrides (surface-to-field fleet): CONFIG, DEMO_NUM
+    DEMO_NUM=${DEMO_NUM:-122}
+    CONFIG=${CONFIG:-configs/cylinder2d/config_bench_cyl_ffm_b128.yaml}
+    LOG_FILE="$FRB_LOGS/train_bench_cyl_ffm_${SLURM_JOB_ID}_DemoN${DEMO_NUM}.log"
+    echo "Job $SLURM_JOB_ID on $SLURM_NODELIST, python: $(which python) config=$CONFIG"
+    CUDA_VISIBLE_DEVICES=0 python -m methods.dmfgen.train \
+        --RELOAD \
+        --config "$CONFIG" \
+        --Demo-Num $DEMO_NUM >> "$LOG_FILE" 2>&1
+    echo "exit status: $?"
+train_kolm_dmfgen_cq:
+  purpose: The Kolmogorov DMF-Gen row - upstream GL_rbf_CQ backbone (6.34M) trained by the upstream code on 65-6554
+    sensors per frame; the run is linked into outputs/runs/kolmogorov2d/upstream_gl_rbf_cq_range/.
+  sbatch:
+    time: '48:00:00'
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Upstream code: third_party/PhyCoFlow-MultiFieldReconstruction (site key phycoflow_mfr_root).
+    # The case directory src/methods/dmfgen/kolmogorov_shu_case is copied into its cases/ and trained
+    # there on the upstream copy of the Kolmogorov file (same frames and training statistics as
+    # data/kolmogorov2d/, built by the case's build_dataset.py). eval.upstream_cq samples the
+    # run inside eval.fleet_2d; configs/upstream/<experiment>.yaml must equal the run's
+    # resolved_config.yaml (eval.fleet_select checks it). Resumes the newest run of EXP.
+    set -euo pipefail
+    UP=$(python -c "from paths import site_path; print(site_path('phycoflow_mfr_root'))")
+    CASE=$UP/cases/kolmogorov_shu
+    EXP=kolm_shu_gl_rbf_cq_w296_range
+    mkdir -p "$CASE"
+    cp -r src/methods/dmfgen/kolmogorov_shu_case/. "$CASE/"
+    DS=$UP/datasets/kolmogorov_shu/kolmogorov_shu.h5
+    if [ ! -f "$DS" ]; then
+      mkdir -p "$(dirname "$DS")"
+      python "$CASE/build_dataset.py" --source "$FRB_ROOT/data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5" \
+        --manifest "$FRB_ROOT/data/kolmogorov2d/kolmogorov2d_manifest.json" --out "$DS"
+    fi
+    cd "$CASE"
+    RUN=$(ls -d runs/$EXP/*/ 2>/dev/null | tail -1 || true)
+    EXTRA=""
+    if [ -n "$RUN" ] && [ -f "$RUN/checkpoints/last.pt" ]; then
+      echo "resuming $RUN"; EXTRA="--resume $RUN"
+    elif [ -n "$RUN" ]; then
+      echo "ABORT: $RUN exists without last.pt; inspect before restarting" >&2; exit 1
+    fi
+    python run.py train-base --config configs/base/gl_rbf_cq_w296_range.yaml $EXTRA
+    RUN=$(ls -d runs/$EXP/*/ | tail -1); RUN=${RUN%/}
+    LINK=$FRB_ROOT/outputs/runs/kolmogorov2d/upstream_gl_rbf_cq_range
+    mkdir -p "$LINK"
+    ln -sfn "$CASE/$RUN" "$LINK/$(basename "$RUN")"
+    echo "run linked: $LINK/$(basename "$RUN")"

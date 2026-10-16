@@ -1,0 +1,722 @@
+# Evaluation of the JHTDB rows on the 50-snapshot canonical draw of cube 3 (sensor seed seed*777 + held-out index, 19,531 sensors on U_x and U_z, K = 8). analysis.paired_ci_jhu splits the snapshots into TUNE (odd) and TEST (even), selects each row's setting on TUNE and reports TEST; outputs land in outputs/rescore_jhu/ under the names it reads.
+# python -m launch submit <case> [--variant <name>]; python -m launch list 3d/eval
+
+rescore_jhu:
+  purpose: FNO3D-FM (best/last x NFE 4/16), latent FM (best/last), Senseiver (budget.pt), Set-DeepONet (best/budget)
+    and Set-DeepONet++ (best) on all 50 snapshots.
+  sbatch:
+    time: 04:00:00
+    mem: 240G
+    cpus: 16
+    gpus: 1
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    O=$FRB_ROOT/outputs/rescore_jhu; J=$FRB_ROOT/outputs/runs/JHU
+    run_of() { readlink -f "$(ls -d $J/$1 | tail -1)"; }
+    FNO=$(run_of "baseline_fno/fno3d_xcube_DemoN90_*")
+    LFM=$(run_of "baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN24_*")
+    SEN=$(run_of "baseline_senseiver/Baseline_senseiver_Stage1_DemoN43_*")
+    DON=$(run_of "baseline_deeponet/deeponet_iclr_jhu_xcube_DemoN60_*")
+    DPP=$(run_of "baseline_deeponetpp/deeponetpp_iclr_jhu_xcube_DemoN60_*_p640")
+    mkdir -p $O
+    RC=0
+    for CK in best last; do for NFE in 4 16; do
+      echo "##### fno3d-fm $CK nfe$NFE"; python -u -m methods.dmfgen.ensemble_eval --run-dir "$FNO" --ckpt $CK.pt --split val \
+        --K 8 --n-steps $NFE --n-snapshots 50 --n-obs 19531 19531 --cond-fields 0 2 --seed 0 --op-seed 1000 \
+        --chunk 1953125 --no-figs --out $O/fno3d_N90_${CK}_nfe${NFE}_K8_val50.json || RC=1
+    done; done
+    for CK in best last; do
+      echo "##### latent fm $CK"; python -u -m methods.latent_fm.eval_jhu --run-dir "$LFM" --ckpt $CK --split val \
+        --K 8 --nfe 4 --n-snapshots 50 --seed 0 --op-seed 1000 --cond-fields 0 2 --n-obs 19531 19531 --no-figs \
+        --out $O/latentfm_N24_${CK}_K8_nfe4_val50.json || RC=1
+    done
+    echo "##### senseiver"; python -u -m methods.senseiver.eval_jhu --run-dir "$SEN" --ckpt budget.pt --split val \
+      --seed 0 --n-snapshots 50 --n-obs 19531 --out $O/senseiver_N43_budget_val50.json || RC=1
+    for CK in best budget; do
+      echo "##### set-deeponet $CK"; python -u -m methods.deeponet.eval_jhu --run-dir "$DON" --ckpt $CK.pt --split val \
+        --seed 0 --n-obs 19531 --n-snapshots 50 --cond-fields 0 2 --out $O/deeponet_N60_${CK}_val50.json || RC=1
+    done
+    echo "##### set-deeponet++ p640"; python -u -m methods.deeponet.eval_jhu_pp --run-dir "$DPP" --ckpt best.pt --split val \
+      --seed 0 --n-obs 19531 --n-snapshots 50 --cond-fields 0 2 --out $O/deeponetpp_p640_best_val50.json || RC=1
+    echo "exit $RC"; exit $RC
+eval_dmfgen_jhu_tune:
+  purpose: DMF-Gen (N15) TUNE grid - best/last x NFE 2/4/8 (best NFE 4 on all 50 snapshots, the others on the odd
+    ones).
+  sbatch:
+    time: 06:00:00
+    mem: 240G
+    cpus: 16
+    gpus: 1
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    O=$FRB_ROOT/outputs/rescore_jhu
+    RD=$(readlink -f "$(ls -d $FRB_ROOT/outputs/runs/JHU/pointcloud_ffm/iclr_jhu_xcube_aug_DemoN15_* | tail -1)")
+    EV="--split val --K 8 --n-snapshots 50 --n-obs 19531 19531 --cond-fields 0 2 --seed 0 --op-seed 1000 --no-figs"
+    mkdir -p $O "$RD/Evaluation"
+    RC=0
+    python -u -m methods.dmfgen.ensemble_eval --run-dir "$RD" --ckpt best.pt --n-steps 4 $EV \
+      --out "$RD/Evaluation/crps_nfe4_K8_all50.json" || RC=1
+    for SET in "best 2" "best 8" "last 2" "last 4" "last 8"; do set -- $SET
+      echo "##### dmfgen $1 nfe$2"; python -u -m methods.dmfgen.ensemble_eval --run-dir "$RD" --ckpt $1.pt --parity odd \
+        --n-steps $2 $EV --out $O/dmfgen_N15_$1_nfe$2_K8_val50odd.json || RC=1
+    done
+    echo "exit $RC"; exit $RC
+band_jhu_test:
+  purpose: TEST-half band passes (band energy and correlation, mean-removed Hann window) at the TUNE-chosen settings
+    - DMF-Gen last NFE 2, latent FM last, FNO3D-FM best NFE 4, Senseiver budget.pt, FNO3D best.pt.
+  sbatch:
+    time: 04:00:00
+    mem: 240G
+    cpus: 16
+    gpus: 1
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    O=$FRB_ROOT/outputs/rescore_jhu; J=$FRB_ROOT/outputs/runs/JHU
+    run_of() { readlink -f "$(ls -d $J/$1 | tail -1)"; }
+    RD=$(run_of "pointcloud_ffm/iclr_jhu_xcube_aug_DemoN15_*")
+    FNO=$(run_of "baseline_fno/fno3d_xcube_DemoN90_*")
+    DET=$(run_of "baseline_fno/fno3d_det_xcube_DemoN97_*")
+    LFM=$(run_of "baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN24_*")
+    SEN=$(run_of "baseline_senseiver/Baseline_senseiver_Stage1_DemoN43_*")
+    EV="--split val --K 8 --n-snapshots 50 --n-obs 19531 19531 --cond-fields 0 2 --seed 0 --op-seed 1000 --no-figs"
+    RC=0
+    python -u -m methods.dmfgen.ensemble_eval --run-dir "$RD" --ckpt last.pt --parity even --band-metrics --n-steps 2 $EV \
+      --out $O/dmfgen_N15_last_nfe2_K8_val50even_band_demean.json || RC=1
+    python -u -m methods.latent_fm.eval_jhu --run-dir "$LFM" --ckpt last --split val --K 8 --nfe 4 --n-snapshots 50 \
+      --seed 0 --op-seed 1000 --cond-fields 0 2 --n-obs 19531 19531 --no-figs --band-metrics \
+      --out $O/latentfm_N24_last_K8_nfe4_val50_band_demean.json || RC=1
+    python -u -m methods.dmfgen.ensemble_eval --run-dir "$FNO" --ckpt best.pt --parity even --band-metrics --n-steps 4 $EV \
+      --chunk 1953125 --out $O/fno3d_N90_best_nfe4_K8_val50even_band_demean.json || RC=1
+    python -u -m methods.senseiver.eval_jhu --run-dir "$SEN" --ckpt budget.pt --split val --seed 0 --n-snapshots 50 \
+      --n-obs 19531 --band-metrics --out $O/senseiver_N43_budget_val50_band_demean.json || RC=1
+    python -u -m methods.dmfgen.ensemble_eval --run-dir "$DET" --ckpt best.pt --split val --K 2 --n-snapshots 50 \
+      --n-obs 19531 19531 --cond-fields 0 2 --seed 0 --op-seed 1000 --no-figs --band-metrics --chunk 1953125 \
+      --out $O/fno3d_det_N97_best_val50_band_demean.json || RC=1
+    echo "exit $RC"; exit $RC
+eval_fno3d_det_jhu:
+  purpose: Deterministic FNO3D (N97) best.pt and last.pt on all 50 snapshots (K = 2 identical members so the fair
+    CRPS is defined), then the inference time per field.
+  sbatch:
+    time: 02:00:00
+    mem: 240G
+    cpus: 16
+    gpus: 1
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    DET=$(readlink -f "$(ls -d $FRB_ROOT/outputs/runs/JHU/baseline_fno/fno3d_det_xcube_DemoN97_* | tail -1)")
+    RC=0
+    for CK in best last; do
+      python -u -m methods.dmfgen.ensemble_eval --run-dir "$DET" --ckpt $CK.pt --split val --K 2 --n-snapshots 50 \
+        --n-obs 19531 19531 --cond-fields 0 2 --seed 0 --op-seed 1000 --no-figs --band-metrics --chunk 1953125 \
+        --out $FRB_ROOT/outputs/rescore_jhu/fno3d_det_N97_${CK}_val50.json || RC=1
+    done
+    python - "$DET" <<'PY' || RC=1
+    import sys, time, torch
+    from methods.dmfgen.ensemble_eval import load_run
+    from methods.dmfgen.helpers import build_sparse_condition
+    model, ds, _ = load_run(sys.argv[1], "best.pt", "cuda:0")
+    item = ds[0]
+    c, f = item["coords"][None].cuda(), item["fields"][None].cuda()
+    torch.manual_seed(0)
+    oc, ov, om, oi, ofid = build_sparse_condition(coords_full=c, fields_full=f, cond_fields=[0, 2],
+                                                  n_obs_min=[19531], n_obs_max=[19531])
+    torch.cuda.reset_peak_memory_stats()
+    with torch.no_grad():
+        for i in range(8):
+            if i == 3:
+                torch.cuda.synchronize(); t0 = time.perf_counter()
+            model.predict(c, oc, ov, om, ofid)
+        torch.cuda.synchronize()
+    print(f"[cost] s/field {(time.perf_counter() - t0) / 5:.4f} peak_GB {torch.cuda.max_memory_allocated() / 1e9:.2f}")
+    PY
+    echo "exit $RC"; exit $RC
+eval_sit_jhu_tune:
+  purpose: SiT-point per-step (re-chunked) sampler, best.pt vs last.pt on the 25 TUNE snapshots, K = 2, two shards
+    per checkpoint.
+  sbatch:
+    time: 03:00:00
+    mem: 128G
+    cpus: 8
+    gpus: 1
+    array: 0-3
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    RUN=$(readlink -f "$(ls -d $FRB_ROOT/outputs/runs/JHU/baseline_sit/matched/Baseline_sit_Stage1_DemoN41_* | tail -1)")
+    CK=$([ $SLURM_ARRAY_TASK_ID -lt 2 ] && echo best || echo last)
+    python -u -m methods.sit.eval_jhu --run-dir "$RUN" --ckpt $CK --split val --parity odd --rechunk \
+      --seed 0 --op-seed 1000 --n-snapshots 50 --K 2 --cond-fields 0 2 --n-obs 19531 19531 \
+      --shard $((SLURM_ARRAY_TASK_ID % 2)) --num-shards 2 --out-dir $FRB_ROOT/outputs/rescore_jhu/sit_N41_${CK}_rechunk_tune_K2
+eval_sit_jhu_test:
+  purpose: SiT-point per-step sampler at the TUNE-chosen last.pt on the 25 TEST snapshots, K = 8, band metrics,
+    five shards.
+  sbatch:
+    time: 03:00:00
+    mem: 48G
+    cpus: 8
+    gpus: 1
+    array: 0-4
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    RUN=$(readlink -f "$(ls -d $FRB_ROOT/outputs/runs/JHU/baseline_sit/matched/Baseline_sit_Stage1_DemoN41_* | tail -1)")
+    python -u -m methods.sit.eval_jhu --run-dir "$RUN" --ckpt last --split val --parity even --rechunk --band-metrics \
+      --seed 0 --op-seed 1000 --n-snapshots 50 --K 8 --cond-fields 0 2 --n-obs 19531 19531 \
+      --shard $SLURM_ARRAY_TASK_ID --num-shards 5 --out-dir $FRB_ROOT/outputs/rescore_jhu/sit_N41_last_rechunk_test_K8_demean
+eval_sit_matched_seeded:
+  purpose: SiT-point with the earlier chunked sampler on all 50 snapshots (SM row), env SIT_CKPT=best|last, five
+    shards.
+  sbatch:
+    time: '8:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+    array: 0-4
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # Resolved at RUN TIME (not submit time) so the dependency-held job picks up the
+    # directory the matched training actually created.
+    RUN=$(readlink -f "$(ls -d outputs/runs/JHU/baseline_sit/matched/Baseline_sit_Stage1_DemoN41_* | tail -1)")
+    CK=${SIT_CKPT:-best}
+    L=$FRB_LOGS/eval_sitm_seed_${CK}_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.log
+    echo "RUN=$RUN CKPT=$CK" > $L
+    python -m methods.sit.eval_jhu \
+      --run-dir "$RUN" --ckpt "$CK" --split val \
+      --seed 0 --op-seed 1000 --n-snapshots 50 --K 8 \
+      --cond-fields 0 2 --n-obs 19531 19531 \
+      --shard $SLURM_ARRAY_TASK_ID --num-shards 5 >> $L 2>&1
+    echo "rc=$?" >> $L
+tune_s3gm_jhu_norm:
+  purpose: S3GM normalized-guidance coefficients (zeta) on six TUNE snapshots, K = 2, N = 200 (writes Evaluation/norm_guidance_tuning/winner.json
+    of the prior run).
+  sbatch:
+    time: '12:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export MPLBACKEND=Agg
+    D=$FRB_ROOT/outputs/scratch/s3gm_improve
+    python -u -m methods.s3gm.tuning.tune_norm_guidance
+    echo "tune rc=$?"
+eval_s3gm_jhu_norm_test:
+  purpose: S3GM normalized-guidance arm at last.pt on the 25 TEST snapshots, K = 8, N = 200, two shards; the zetas
+    are the TUNE winner (tune_s3gm_jhu_norm).
+  sbatch:
+    time: 03:50:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+    array: 0-1
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 MPLCONFIGDIR=/tmp TQDM_DISABLE=1
+    RUN=$(readlink -f "$(ls -d $FRB_ROOT/outputs/runs/JHU/baseline_s3gm/matched/Baseline_s3gm_Stage1_DemoN94_* | head -1)")
+    ZETA=${ZETA:-"17.8 5.34"}
+    if [ "$SLURM_ARRAY_TASK_ID" -eq 0 ]; then SNAPS=$(seq -s ' ' 0 2 24); else SNAPS=$(seq -s ' ' 26 2 48); fi
+    python -u -m methods.s3gm.eval_jhu --run-dir "$RUN" --ckpt last --split val --snaps $SNAPS \
+      --seed 0 --op-seed 1000 --K 8 --cond-fields 0 2 --n-obs 19531 19531 \
+      --norm-guidance $ZETA \
+      --out outputs/rescore_jhu/s3gm_norm_last_test_shard${SLURM_ARRAY_TASK_ID}.json
+s3gm_finalize:
+  purpose: S3GM retuned-guidance arm (SM row) - stability check of (alpha, beta) on the final checkpoint, the arm
+    on all 50 snapshots at last.pt and best.pt, and the upstream guidance on 5 snapshots (diverges).
+  sbatch:
+    time: '16:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    # Post-training: (1) re-confirm the stabilised (alpha,beta) on the FINAL
+    # checkpoint, (2) evaluate the JHU-tuned arm, (3) evaluate the upstream arm to
+    # document its divergence. Both arms are reported; neither substitutes.
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export MPLBACKEND=Agg
+    RUN=$(ls -dt outputs/runs/JHU/baseline_s3gm/matched/Baseline_s3gm_Stage1_DemoN94_* | head -1)
+    L="$FRB_LOGS/s3gm_finalize_${SLURM_JOB_ID}.log"
+    echo "RUN=$RUN" >> "$L"
+
+    echo "===== STEP 1: stability re-confirmation on FINAL checkpoint =====" >> "$L"
+    ISO_ARMS=v3 python -u -m methods.s3gm.tuning.isolate --run-dir "$RUN" --ckpt last --n-steps 200 \
+        --device auto --out "$RUN/isolation_final.json" >> "$L" 2>&1
+    echo "step1 rc=$?" >> "$L"
+
+    for CK in last best; do
+      echo "===== STEP 2: eval arm=jhu_tuned ckpt=$CK =====" >> "$L"
+      python -u -m methods.s3gm.eval_jhu --run-dir "$RUN" --ckpt $CK --arm jhu_tuned \
+          --seed 0 --op-seed 1000 --n-snapshots 50 --K 8 \
+          --cond-fields 0 2 --n-obs 19531 19531 >> "$L" 2>&1
+      echo "eval jhu_tuned $CK rc=$?" >> "$L"
+    done
+
+    echo "===== STEP 3: eval arm=upstream (documents divergence, 5 snaps) =====" >> "$L"
+    python -u -m methods.s3gm.eval_jhu --run-dir "$RUN" --ckpt last --arm upstream \
+        --seed 0 --op-seed 1000 --n-snapshots 5 --K 2 \
+        --cond-fields 0 2 --n-obs 19531 19531 >> "$L" 2>&1
+    echo "eval upstream rc=$?" >> "$L"
+s3gm_jhu_sweep:
+  purpose: S3GM guidance legs on TUNE snapshots of one prior (env S3GM_RUN, LEGS); with the sigma_max-rule prior
+    it gives the divergence numbers of the SM.
+  sbatch:
+    time: 04:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export MPLBACKEND=Agg
+    RUN=${S3GM_RUN:-$(ls -dt outputs/runs/JHU/baseline_s3gm/matched/Baseline_s3gm_Stage1_DemoN94_* | head -1)}
+    SPLIT=${SPLIT:-tune}; SNAPS=${SNAPS:-25}; K=${K:-8}; CK=${CK:-last}
+    LEGS=${LEGS:?set LEGS, e.g. "custom,0,0,1000,1;jhu_tuned,,,1000,1;upstream,,,1000,2;jhu_tuned,,,200,1" (the SM sigma_max-rule legs, SNAPS=2 K=2)}
+    L="$FRB_LOGS/s3gm_jhu_sweep_legs_${SLURM_JOB_ID}.log"
+    echo "RUN=$RUN SPLIT=$SPLIT SNAPS=$SNAPS K=$K CK=$CK LEGS=$LEGS" >> "$L"
+    echo "$LEGS" | tr ';' '\n' | while IFS=, read ARM AC BE NS OL; do
+      EXTRA=""; [ "$ARM" = custom ] && EXTRA="--alpha-case $AC --beta $BE"
+      echo "===== arm=$ARM alpha_case=$AC beta=$BE n_steps=$NS overlap=$OL =====" >> "$L"
+      python -u -m methods.s3gm.eval_jhu --run-dir "$RUN" --ckpt "$CK" --arm "$ARM" $EXTRA \
+          --split "$SPLIT" --n-steps "$NS" --overlap "$OL" \
+          --seed 0 --op-seed 1000 --n-snapshots "$SNAPS" --K "$K" \
+          --cond-fields 0 2 --n-obs 19531 19531 >> "$L" 2>&1 || echo "leg $ARM N=$NS ol=$OL FAILED" >> "$L"
+    done
+    grep -c FAILED "$L" >/dev/null && exit 1 || exit 0
+eval_gen4turb_jhu:
+  purpose: Gen4Turb on the 120^3 crop - the last three periodic saves on all 50 snapshots (K = 8; TUNE picks among
+    them), then the x<->z reflection diagnostic of the final save.
+  sbatch:
+    time: 04:00:00
+    mem: 48G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u -o pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    RUN=models_uxuz_octa_s2027
+    FNO=$(readlink -f "$(ls -d outputs/runs/JHU/baseline_fno/fno3d_xcube_DemoN90_* | tail -1)")   # dataset statistics
+    RC=0
+    for CK in model_3590 model_3890 model_4190; do
+      python -u -m methods.gen4turb.eval_jhu --ckpt $RUN/$CK.pt --run-dir $FNO --K 8 --seed 0 \
+        --out outputs/rescore_jhu/gen4turb_octa_${CK}_crop120_val50.json 2>&1 | grep -v "sampling time step" || RC=1
+    done
+    python -u -m analysis.diagnostics.gen4turb_diag $RUN/model_4190.pt 150,163,180,20,70,120 std,swap 4 octa_swap \
+      2>&1 | grep -v "sampling time step" || RC=1
+    echo "exit $RC"; exit $RC
+eval_dmfgen_spec_jhu:
+  purpose: DMF-Gen spectral-penalty SM rows at last.pt on the TEST half with band metrics, NFE 4 - task 0 the 4-cube
+    run (N29), task 1 the 20-cube run (in its own normalization).
+  sbatch:
+    time: 04:00:00
+    mem: 240G
+    cpus: 16
+    gpus: 1
+    array: 0-1
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    P=$FRB_ROOT/outputs/runs/JHU/pointcloud_ffm
+    PATS=("iclr_jhu_xcube_spec02_DemoN29_*" "iclr_jhu_scale_DemoN*")
+    TAGS=(N29 N36)
+    RD=$(readlink -f "$(ls -d $P/${PATS[$SLURM_ARRAY_TASK_ID]} | tail -1)"); TAG=${TAGS[$SLURM_ARRAY_TASK_ID]}
+    EV="--split val --K 8 --n-snapshots 50 --n-obs 19531 19531 --cond-fields 0 2 --seed 0 --op-seed 1000 --no-figs"
+    python -u -m methods.dmfgen.ensemble_eval --run-dir "$RD" --ckpt last.pt --parity even --band-metrics --n-steps 4 $EV \
+      --out $FRB_ROOT/outputs/rescore_jhu/dmfgen_spec_${TAG}_last_nfe4_K8_test_band.json
+eval_dmfgen_scale_sharedstats:
+  purpose: The 20-cube DMF-Gen SM row scored in the 4-cube normalization shared by every other row (--score-stats);
+    the 4-cube spectral run alongside as the check (must equal its eval_dmfgen_spec_jhu payload).
+  sbatch:
+    time: 03:00:00
+    mem: 240G
+    cpus: 16
+    gpus: 1
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    O=$FRB_ROOT/outputs/rescore_jhu
+    J=$FRB_ROOT/outputs/runs/JHU
+    run_of() { readlink -f "$(ls -d $J/$1 | tail -1)"; }
+    STATS=$(run_of "pointcloud_ffm/iclr_jhu_xcube_aug_DemoN15_*")/dataset_stats.pt
+    EV="--split val --K 8 --n-snapshots 50 --n-obs 19531 19531 --cond-fields 0 2 --seed 0 --op-seed 1000 --no-figs"
+    python -u -m methods.dmfgen.ensemble_eval --run-dir "$(run_of 'pointcloud_ffm/iclr_jhu_scale_DemoN*')" --ckpt last.pt --parity even \
+      --band-metrics --n-steps 4 $EV --score-stats $STATS \
+      --out $O/dmfgen_spec_N36_last_nfe4_K8_test_band_sharedstats.json > $FRB_LOGS/dmfgen_spec_sharedstats_${SLURM_JOB_ID}_N36.log 2>&1 &
+    python -u -m methods.dmfgen.ensemble_eval --run-dir "$(run_of 'pointcloud_ffm/iclr_jhu_xcube_spec02_DemoN29_*')" --ckpt last.pt --parity even \
+      --band-metrics --n-steps 4 $EV --score-stats $STATS \
+      --out $O/dmfgen_spec_N29_last_nfe4_K8_test_band_sharedstats_check.json > $FRB_LOGS/dmfgen_spec_sharedstats_${SLURM_JOB_ID}_N29.log 2>&1 &
+    RC=0
+    for j in $(jobs -p); do wait $j || RC=1; done
+    echo "exit $RC"; exit $RC
+confild_eval_canonical:
+  purpose: CoNFiLD 32-snapshot-window rows (SM) - all 50 snapshots, K = 8, DPS scale 1.0, best and last; argument
+    = the arm's save root.
+  sbatch:
+    time: 08:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    #
+    # usage: python -m launch submit --dependency=afterany:<trainjob> confild_eval_canonical <arm-save-root>
+    #
+    # Canonical CoNFiLD evaluation of the unified two-stage checkpoints:
+    #   seed 0, op-seed 1000, all 50 held-out snapshots, K=8, DPS scale 1.0,
+    #   cond fields 0 2, FIXED 19,531 sensors per channel, 1000 DDPM steps.
+    # Fingerprint must read: [seedcheck] snap=29 sensors=39062 idx_sum=37987162596
+    #
+    # Evaluates BOTH checkpoint selections:
+    #   best = diagnostic-selected stage-1 codec + final stage-2 prior
+    #   last = budget-matched stage-1 codec     + final stage-2 prior
+    # (stage-2 best.pt and last.pt are written by the same save call and are
+    # expected identical; md5sums below put that on the record).
+    # Outputs land in the STAGE-2 run dir's Evaluation/ as
+    # crps_canonical_{best,last}_snap*.json / _summary.json + zslice figures.
+
+    set -euo pipefail
+    REPO=$FRB_ROOT
+    ARM_ROOT="${1:?usage: frb_submit confild_eval_canonical <arm-save-root>}"
+
+    export CUDA_VISIBLE_DEVICES=0
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 MPLCONFIGDIR=/tmp TQDM_DISABLE=1
+
+    S1DIR=$(ls -d "${ARM_ROOT}"/Baseline_confild_Stage1_DemoN23_* 2>/dev/null | grep -v ABORTED | sort | tail -1)
+    S2DIR=$(ls -d "${ARM_ROOT}"/Baseline_confild_Stage2_DemoN23_* 2>/dev/null | grep -v ABORTED | sort | tail -1)
+    [ -n "${S1DIR}" ] || { echo "FATAL: no stage-1 run dir under ${ARM_ROOT}"; exit 1; }
+    [ -n "${S2DIR}" ] || { echo "FATAL: no stage-2 run dir under ${ARM_ROOT} (stage 2 never started?)"; exit 1; }
+    echo "node       : $(hostname)"
+    echo "stage1 dir : ${S1DIR}"
+    echo "stage2 dir : ${S2DIR}"
+    md5sum "${S1DIR}/best.pt" "${S1DIR}/last.pt" "${S2DIR}/best.pt" "${S2DIR}/last.pt" || true
+
+    for SEL in best last; do
+      echo "=== canonical eval: ${SEL} ==="
+      python -m methods.confild.eval_unified \
+        --stage1-ckpt "${S1DIR}/${SEL}.pt" \
+        --stage2-ckpt "${S2DIR}/${SEL}.pt" \
+        --out-dir "${S2DIR}" \
+        --tag "canonical_${SEL}" \
+        --seed 0 --op-seed 1000 --n-snapshots 50 --K 8 \
+        --cond-fields 0 2 --n-obs 19531 19531 \
+        --dps-scale 1.0 --steps 1000 --row-chunk 4
+    done
+    echo "=== eval done ==="
+confild_window1:
+  purpose: CoNFiLD single-snapshot arm (only the target row of each window carries sensors) of the published-prior
+    run at the published DPS scale 1.0, all 50 snapshots, K = 8.
+  sbatch:
+    time: '16:00:00'
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Single-snapshot arm of the published-prior run: each snapshot is reconstructed from a
+    # joint window sample in which only the target row carries sensors, the information the
+    # single-snapshot methods receive. Published DPS scale 1.0, all 50 snapshots, K = 8.
+    set -euo pipefail
+
+    ROOT=$FRB_ROOT
+    BC=$ROOT/outputs/runs/JHU/baseline_confild
+    S1=$BC/unified_published_prior/Baseline_confild_Stage1_DemoN23_20260828_182524/best.pt
+    S2=$BC/unified_published_prior/Baseline_confild_Stage2_DemoN23_20260829_075611/best.pt
+    OUT=$BC/improve/window1_P
+    export CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 MPLCONFIGDIR=/tmp TQDM_DISABLE=1
+    mkdir -p "$OUT"
+    echo "node: $(hostname)"
+    python -m methods.confild.eval_unified2 \
+      --stage1-ckpt "$S1" --stage2-ckpt "$S2" --out-dir "$OUT" \
+      --tag window1 --n-snapshots 50 --K 8 --dps-scale 1.0 --window1
+    echo "=== B4 done ==="
+confild_window1_scale:
+  purpose: CoNFiLD single-snapshot arm, DPS guidance scale on six TUNE snapshots (K = 2) - one array task per (scale,
+    stage-2 checkpoint).
+  sbatch:
+    time: 02:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+    array: 0-6
+  body: |
+    # The published scale 1.0 was set for 32 sensed rows; with one sensed row the per-row push is
+    # ~sqrt(32) larger.
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 MPLCONFIGDIR=/tmp TQDM_DISABLE=1
+    SCALES=(0.03 0.1 0.18 0.3 0.06 0.14 0.1); CKPTS=(best best best best best best last)
+    SC=${SCALES[$SLURM_ARRAY_TASK_ID]}; CK=${CKPTS[$SLURM_ARRAY_TASK_ID]}
+    ARM=$FRB_ROOT/outputs/runs/JHU/baseline_confild/unified_published_prior
+    S1=$(ls -d $ARM/Baseline_confild_Stage1_DemoN23_* | grep -v ABORTED | sort | tail -1)/best.pt
+    S2=$(ls -d $ARM/Baseline_confild_Stage2_DemoN23_* | grep -v ABORTED | sort | tail -1)/$CK.pt
+    OUT=outputs/rescore_jhu/confild_window1_scale
+    mkdir -p $OUT
+    TAG=w1_scale$SC; [ "$CK" = best ] || TAG=w1_${CK}_scale$SC
+    python -u -m methods.confild.eval_unified2 \
+      --stage1-ckpt "$S1" --stage2-ckpt "$S2" --out-dir "$OUT" \
+      --tag $TAG --window1 --snaps 1 7 13 19 25 31 --K 2 --seed 0 --op-seed 1000 \
+      --cond-fields 0 2 --n-obs 19531 19531 --dps-scale $SC --steps 1000 --row-chunk 4 --no-figs
+confild_window1_full:
+  purpose: CoNFiLD single-snapshot arm at the TUNE-chosen checkpoint and DPS scale (env CK, SC; default best, 0.1)
+    on all 50 snapshots, K = 8, five shards.
+  sbatch:
+    time: 03:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+    array: 0-4
+  body: |
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 MPLCONFIGDIR=/tmp TQDM_DISABLE=1
+    CK=${CK:-best}; SC=${SC:-0.1}
+    ARM=$FRB_ROOT/outputs/runs/JHU/baseline_confild/unified_published_prior
+    S1=$(ls -d $ARM/Baseline_confild_Stage1_DemoN23_* | grep -v ABORTED | sort | tail -1)/best.pt
+    S2=$(ls -d $ARM/Baseline_confild_Stage2_DemoN23_* | grep -v ABORTED | sort | tail -1)/$CK.pt
+    OUT=outputs/rescore_jhu/confild_window1_${CK}_scale$SC
+    mkdir -p $OUT
+    SNAPS=$(seq -s ' ' $((SLURM_ARRAY_TASK_ID * 10)) $((SLURM_ARRAY_TASK_ID * 10 + 9)))
+    python -u -m methods.confild.eval_unified2 \
+      --stage1-ckpt "$S1" --stage2-ckpt "$S2" --out-dir "$OUT" \
+      --tag w1 --window1 --snaps $SNAPS --K 8 --seed 0 --op-seed 1000 \
+      --cond-fields 0 2 --n-obs 19531 19531 --dps-scale $SC --steps 1000 --row-chunk 4 --no-figs
+eval_jhu_insample:
+  purpose: In-sample probe (SM) - latent FM, FNO3D-FM, the spectral DMF-Gen and IDW / nearest neighbour on 50 frames
+    of the training cubes.
+  sbatch:
+    time: 06:00:00
+    mem: 160G
+    cpus: 16
+    gpus: 1
+  body: |
+    #
+    # 3D IN-SAMPLE LEAKAGE PROBE (2026-09-14). The frozen canonical JHU checkpoints
+    # are scored on 50 frames drawn from the TRAIN cubes (0-2) instead of the
+    # held-out cube 3 -- the 3D analogue of the 2D seen-trajectory probe in
+    # experiments/eval_kolm_litprotocol.py, and the ceiling any random-in-time split could
+    # reach (a training frame is r = 1.00 with itself). IDW / nearest neighbour on
+    # the same frames are the training-free frame-difficulty control.
+    #
+    # Same protocol as the canonical rows in every other respect: seed 0, sensors
+    # 19531 per observed field on cond_fields [0, 2], K = 8, NFE 4, snapshot
+    # positions chosen by np.random.default_rng(0).choice(150, 50) in every leg, and
+    # sensors drawn under torch.manual_seed(seed*777 + position). Outputs are keyed
+    # 'insample' in the filename and carry split / protocol / snapshot_ids in the
+    # payload, so they can never be selected as canonical rows.
+    set -uo pipefail
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+
+    # Absolute: eval_latentfm_ensemble resolves a relative --run-dir against the
+    # repo directory, not src/, so outputs/runs would escape the repo.
+    J=$FRB_ROOT/outputs/runs/JHU
+    DATA=$FRB_ROOT/data/JHU_4cubes_stride100.h5
+    LFM=$J/baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN24_20260828_164541
+    DMF=$J/pointcloud_ffm/iclr_jhu_xcube_spec02_DemoN29_20260822_140100
+    FNO=$J/baseline_fno/fno3d_matched_DemoN90_20260828_181849
+    RC=0
+
+    echo "=== latent FM (best) in-sample ==="
+    python -u -m methods.latent_fm.eval_jhu --run-dir "$LFM" --ckpt best \
+      --K 8 --nfe 4 --n-snapshots 50 --seed 0 --op-seed 1000 \
+      --cond-fields 0 2 --n-obs 19531 19531 --split train \
+      --out "$LFM/Evaluation/lfm_insample_train_best_K8_nfe4.json" || RC=1
+
+    echo "=== classical floors in-sample (constant, kdtree, idw) ==="
+    python -u -m methods.classical.anchors_jhu --methods constant kdtree idw \
+      --data "$DATA" --run-dir "$DMF" \
+      --n-obs 19531 --n-snapshots 50 --seed 0 --eval-split train \
+      --tag insample_train_n19531 --out-dir $J/baseline_classical || RC=1
+
+    echo "=== FNO3D (last) in-sample ==="
+    python -u -m methods.dmfgen.ensemble_eval --run-dir "$FNO" --ckpt last.pt \
+      --K 8 --n-steps 4 --n-snapshots 50 --n-obs 19531 19531 --cond-fields 0 2 \
+      --seed 0 --op-seed 1000 --chunk 1953125 --no-figs --split train \
+      --out "$FNO/Evaluation/insample_train_last_nfe4_K8_all50.json" || RC=1
+
+    echo "=== DMF-Gen (best) in-sample ==="
+    python -u -m methods.dmfgen.ensemble_eval --run-dir "$DMF" --ckpt best.pt \
+      --K 8 --n-steps 4 --n-snapshots 50 --n-obs 19531 19531 --cond-fields 0 2 \
+      --seed 0 --op-seed 1000 --chunk 1953125 --no-figs --split train \
+      --out "$DMF/Evaluation/insample_train_all50_nfe4_K8.json" || RC=1
+
+    echo "rc=$RC end=$(date)"
+    exit $RC
+dump_calib_latentfm:
+  purpose: Latent FM per-point ensembles (calibration dumps) at 0.1 / 1 / 10 % sensing, one array task per density.
+  sbatch:
+    time: 06:00:00
+    mem: 200G
+    cpus: 8
+    gpus: 1
+    array: 0-2
+  body: |
+    # Per-point latent-FM ensembles for the distance-binned conformal recalibration
+    # (run_conformal_all), one array task per density: 0.1 / 1 / 10 % of the 125^3 grid per
+    # observed channel. The evaluation and the dump come from one sampling pass. The output
+    # directories carry the density, so no two densities share a file name.
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    RD=$FRB_ROOT/outputs/runs/JHU/baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN24_20260828_164541
+    NOBS_LIST=(1953 19531 195312)
+    NOBS=${NOBS_LIST[$SLURM_ARRAY_TASK_ID]}
+    OUT="$RD/Evaluation/calib_points_n${NOBS}_K8_nfe4"
+    L=$FRB_LOGS/lfm_calib_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.log
+    echo "task=$SLURM_ARRAY_TASK_ID n_obs=$NOBS host=$(hostname) start=$(date)" > $L
+    python -m methods.latent_fm.eval_jhu --run-dir "$RD" --ckpt best \
+        --K 8 --nfe 4 --n-snapshots 50 \
+        --cond-fields 0 2 --n-obs $NOBS $NOBS \
+        --query-subset 200000 --no-figs \
+        --out "$RD/Evaluation/lfm_calib_n${NOBS}_K8_nfe4.json" \
+        --dump-calib-dir "$OUT" >> $L 2>&1
+    RC=$?
+    echo "end=$(date) rc=$RC" >> $L
+    exit $RC
+run_conformal_all:
+  purpose: Distance-binned split-conformal recalibration fitted on TUNE and frozen on TEST, for every calibration
+    dump of one run (env RD, PREFIX; RD=<latent FM run> PREFIX=conformal_lfm_ for the SM numbers).
+  sbatch:
+    time: 00:40:00
+    mem: 200G
+    cpus: 16
+    gpus: 1
+  body: |
+    # Distance-binned conformal recalibration on every calibration dump of one run
+    # (dump_calib_latentfm). Fits the per-distance-bin conformal quantile on TUNE (odd snapshots),
+    # reports coverage frozen on TEST (even) before and after. Compute node: the
+    # dumps are O(GB) of npz.
+    #
+    # The output name must key the MODEL, not just the density tag: the tag
+    # (calib_points_n19531_K8_nfe4) is identical for every model, so a second model
+    # run with the default prefix would silently overwrite the first one's JSON.
+    # DMF-Gen keeps the historical prefix "conformal_"; any other run dir must
+    # pass its own, e.g.
+    #   RD=outputs/runs/JHU/baseline_latent_fm/<run> PREFIX=conformal_lfm_ python -m launch submit run_conformal_all
+    set -uo pipefail
+    DMFGEN_RD=outputs/runs/JHU/pointcloud_ffm/iclr_jhu_xcube_spec02_DemoN29_20260822_140100
+    RD=${RD:-$DMFGEN_RD}
+    PREFIX=${PREFIX:-conformal_}
+    if [ "$RD" != "$DMFGEN_RD" ] && [ "$PREFIX" = "conformal_" ]; then
+      echo "[guard] non-DMF-Gen RD needs its own PREFIX (would overwrite DMF-Gen's conformal_*.json)"; exit 2
+    fi
+    OUT=outputs/paper/recalib
+    mkdir -p $OUT
+    RC=0
+    for D in $RD/Evaluation/calib_points_n*_K8_nfe4; do
+      [ -d "$D" ] || continue
+      n=$(ls "$D"/calib_points_snap*.npz 2>/dev/null | wc -l)
+      if [ "$n" -lt 40 ]; then echo "[skip] $(basename $D): only $n snapshots (dump incomplete)"; continue; fi
+      tag=$(basename "$D")
+      echo "=== $tag ($n snapshots) ==="
+      python -m calibration.conformal_recalib --dump-dir "$D" --out "$OUT/${PREFIX}${tag}.json" || RC=1
+    done
+    exit $RC
+eval_deeponet:
+  purpose: Set-DeepONet evaluation and sensor-count sweep of one checkpoint (chained by train_deeponet; env RUN_DIR,
+    CKPT).
+  sbatch:
+    time: 04:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # DeepONet evaluation on the shared ICLR protocol.
+    #
+    # MUST run on a compute node: torch.randperm on CUDA is not portable across
+    # GPU SKU, and the canonical fingerprint (snap=29 sensors=39062
+    # idx_sum=37987162596) only reproduces on the H100 SXM compute nodes.
+    #
+    # No trailing `echo "exit status: $?"` without an explicit `exit $status`:
+    # a bare echo would force exit 0 and a crash would report COMPLETED.
+
+    set -u
+    set -o pipefail
+
+    export JHU_SPLIT_MODE=block
+    export JHU_SPLIT_GAP=0
+    export JHU_AUGMENT=octahedral          # train-split only inside the dataset
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export TQDM_DISABLE=1
+
+
+    RUN_DIR=${RUN_DIR:?set RUN_DIR}
+    CKPT=${CKPT:-best.pt}
+    NSNAP=${NSNAP:-50}
+    EXTRA=${EXTRA:-}
+    LOG=$FRB_LOGS/eval_deeponet_$(basename "$RUN_DIR")_${CKPT%.pt}_${SLURM_JOB_ID}.log
+
+    python -u -m methods.deeponet.eval_jhu \
+      --run-dir "$RUN_DIR" \
+      --ckpt "$CKPT" \
+      --split val \
+      --seed 0 \
+      --n-obs 19531 \
+      --n-snapshots "$NSNAP" \
+      --cond-fields 0 2 \
+      --sweep 1953 3906 7812 15625 19531 \
+      --sweep-snapshots 8 \
+      --out "$RUN_DIR/Evaluation/iclr_protocol_eval_${CKPT%.pt}.json" \
+      $EXTRA >> "$LOG" 2>&1
+    status=$?
+    echo "python exit status: $status" >> "$LOG"
+    exit $status
+eval_deeponetpp:
+  purpose: Set-DeepONet++ evaluation of one checkpoint, optionally on the TUNE / TEST subsets (chained by train_deeponetpp).
+  sbatch:
+    time: 04:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # DeepONet++ evaluation = canonical eval_deeponet_iclr.py via the
+    # eval_deeponetpp.py wrapper (builder swap only).  MUST run on a compute node
+    # (canonical fingerprint snap=29 sensors=39062 idx_sum=37987162596 is
+    # H100-SXM-specific).  Optional env:
+    #   SNAPIDS  comma-separated val indices (TUNE odd / TEST even subsets)
+    #   LABEL    subset label stamped into the JSON
+    #   OUTNAME  output JSON basename (default derived from CKPT)
+
+    set -u
+    set -o pipefail
+
+    export JHU_SPLIT_MODE=block
+    export JHU_SPLIT_GAP=0
+    export JHU_AUGMENT=octahedral
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export TQDM_DISABLE=1
+
+
+    TMPD=$FRB_LOGS
+    RUN_DIR=${RUN_DIR:?set RUN_DIR}
+    CKPT=${CKPT:-best.pt}
+    NSNAP=${NSNAP:-50}
+    SNAPIDS=${SNAPIDS:-}
+    LABEL=${LABEL:-}
+    OUTNAME=${OUTNAME:-iclr_protocol_eval_${CKPT%.pt}}
+    EXTRA=${EXTRA:-}
+    LOG=$TMPD/eval_deeponetpp_$(basename "$RUN_DIR")_${OUTNAME}_${SLURM_JOB_ID}.log
+
+    DPNPP_SNAPSHOT_IDS="$SNAPIDS" DPNPP_SUBSET_LABEL="$LABEL" \
+    python -u -m methods.deeponet.eval_jhu_pp \
+      --run-dir "$RUN_DIR" \
+      --ckpt "$CKPT" \
+      --split val \
+      --seed 0 \
+      --n-obs 19531 \
+      --n-snapshots "$NSNAP" \
+      --cond-fields 0 2 \
+      --sweep 1953 3906 7812 15625 19531 \
+      --sweep-snapshots 8 \
+      --out "$RUN_DIR/Evaluation/${OUTNAME}.json" \
+      $EXTRA >> "$LOG" 2>&1
+    status=$?
+    echo "python exit status: $status" >> "$LOG"
+    exit $status

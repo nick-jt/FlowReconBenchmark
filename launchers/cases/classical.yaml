@@ -1,0 +1,239 @@
+# Training-free anchors (training mean, nearest neighbour, IDW, gappy POD, ridge gappy POD, LSE) on every regime. GPU nodes only for the CUDA sensor draw that every method shares.
+# python -m launch submit <case> [--variant <name>]; python -m launch list classical
+
+run_classical_kolm:
+  purpose: Kolmogorov anchors at 655 sensors on the 50 TEST frames, non-periodic and periodic neighbour search.
+  sbatch:
+    time: 04:00:00
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -u
+
+    H5=$FRB_ROOT/data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5
+    OUT=outputs/runs/kolmogorov2d/baseline_classical
+    mkdir -p "$OUT"
+
+    python -u -m methods.classical.anchors_2d \
+        --h5 "$H5" \
+        --train-frames 2560 --fields vorticity --cond-fields 0 \
+        --methods constant kdtree idw gappy_pod --pod-ranks 5 10 20 40 80 160 320 640 --idw-k 8 \
+        --n-frames 50 --no-periodic --verify-percentile --tag main_1pct_nonperiodic \
+        --out-dir "$OUT"
+
+    python -u -m methods.classical.anchors_2d \
+        --h5 "$H5" \
+        --train-frames 2560 --fields vorticity --cond-fields 0 \
+        --methods constant kdtree idw gappy_pod --pod-ranks 5 10 20 40 80 160 320 640 --idw-k 8 \
+        --n-frames 50 --periodic --tag main_1pct_periodic \
+        --out-dir "$OUT"
+
+    echo "classical kolm2d done"
+run_classical_kolm_sweep:
+  purpose: Kolmogorov anchors at 65/164/655/1965/6554 sensors (density figure).
+  sbatch:
+    time: 00:30:00
+    mem: 32G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Sensor-count sweep for the performance-vs-N figure (2D panel).
+    # N = {65,164,655,1965,6554} = 0.1/0.25/1/3/10% of 256^2.
+    set -u
+
+    python -u -m methods.classical.anchors_2d \
+        --h5 $FRB_ROOT/data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5 \
+        --train-frames 2560 --fields vorticity --cond-fields 0 \
+        --methods constant kdtree idw gappy_pod --pod-ranks 5 10 20 40 80 160 320 640 --idw-k 8 \
+        --n-sensors 65 164 655 1965 6554 \
+        --n-frames 50 --no-periodic --tag sweep_nonperiodic \
+        --out-dir outputs/runs/kolmogorov2d/baseline_classical
+    echo "sweep done"
+run_classical_cyl:
+  purpose: Cylinder-mesh anchors at 238 sensors per observed velocity component, p unobserved.
+  sbatch:
+    time: 01:00:00
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Classical anchors on the native cylinder mesh (23800 cells). Non-periodic is
+    # the default and correct here (cylinder wake is not periodic). Sensors default
+    # to 1% = 238 per observed field; velocities only (--cond-fields 0 1), p never
+    # observed. The cylinder wake IS low-rank, so gappy-POD is the anchor to beat:
+    # rank 80 as the fleet default plus a rank-20 tag to probe the POD sweet spot.
+    # GPU node because the sensor draw runs on cuda:0 (the CUDA sensor-draw guard).
+    set -u
+
+    H5=$FRB_ROOT/data/cylinder2d/Cylinder2D_mesh.h5
+    OUT=outputs/runs/cylinder2d/baseline_classical
+    mkdir -p "$OUT"
+
+    python -u -m methods.classical.anchors_2d \
+        --h5 "$H5" \
+        --train-frames 1200 --fields Ux Uy p --cond-fields 0 1 \
+        --methods constant kdtree idw gappy_pod --pod-ranks 5 10 20 40 80 160 320 640 --idw-k 8 \
+        --n-frames 50 --stratify-blocks 2 --no-periodic --verify-percentile --tag main_1pct \
+        --out-dir "$OUT"
+
+
+    echo "classical cyl2d done"
+run_classical_cyl_surface:
+  purpose: Surface-task anchors at 32/64/128/360 taps per field on the wall ring.
+  sbatch:
+    time: 01:00:00
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    # SURFACE-TO-FIELD variant: sensors only on the 360-cell wall ring (all three
+    # fields at the taps), tap budget 32/64/128/360. Prediction 2 of the
+    # pre-registration: IDW/kdtree collapse toward the train-mean floor; the
+    # honest risk (prediction 3) is that gappy POD still wins.
+    # Classical anchors on the native cylinder mesh (23800 cells).
+    # the default and correct here (cylinder wake is not periodic). Sensors default
+    # to 1% = 238 per observed field; velocities only (--cond-fields 0 1), p never
+    # observed. The cylinder wake IS low-rank, so gappy-POD is the anchor to beat:
+    # rank 80 as the fleet default plus a rank-20 tag to probe the POD sweet spot.
+    # GPU node because the sensor draw runs on cuda:0 (the CUDA sensor-draw guard).
+    set -u
+
+    H5=$FRB_ROOT/data/cylinder2d/Cylinder2D_mesh.h5
+    OUT=outputs/runs/cylinder2d_surface/baseline_classical
+    mkdir -p "$OUT"
+
+    python -u -m methods.classical.anchors_2d \
+        --h5 "$H5" \
+        --train-frames 1200 --fields Ux Uy p --cond-fields 0 1 2 --sensor-pool surface --n-sensors 32 64 128 360 \
+        --methods constant kdtree idw gappy_pod --pod-ranks 5 10 20 40 80 160 320 640 --idw-k 8 \
+        --n-frames 50 --stratify-blocks 2 --no-periodic --verify-percentile --tag surface \
+        --out-dir "$OUT"
+
+
+    echo "classical cyl surface done"
+run_classical_ridge_lse:
+  purpose: Surface-task ridge gappy POD and LSE, and the IDW exponent check on the cylinder and Kolmogorov.
+  sbatch:
+    time: 00:30:00
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Stronger linear anchors and the IDW-exponent check. Surface task: ridge
+    # gappy POD and LSE, selected on the same training holdout as the gappy-POD
+    # rank; the unregularized gappy_pod row must reproduce
+    # classical_baselines_surface_2d.json. IDW exponent from {1,2,3} on the
+    # training holdout for the cylinder volume, surface and Kolmogorov tasks.
+    # Outputs avoid the table scripts' globs (classical_baselines_main_*;
+    # cylinder2d_surface/baseline_classical/*), so no canonical JSON is
+    # overwritten or mixed into a table.
+    # GPU node because the sensor draw runs on cuda:0 (the CUDA sensor-draw guard).
+    set -u
+
+    H5=$FRB_ROOT/data/cylinder2d/Cylinder2D_mesh.h5
+
+    python -u -m methods.classical.anchors_2d \
+        --h5 "$H5" \
+        --train-frames 1200 --fields Ux Uy p --cond-fields 0 1 2 --sensor-pool surface --n-sensors 32 64 128 360 \
+        --methods idw gappy_pod gappy_pod_ridge lse --pod-ranks 5 10 20 40 80 160 320 640 --idw-k 8 --idw-power 1 2 3 \
+        --n-frames 50 --stratify-blocks 2 --no-periodic --tag surface_ridge_lse \
+        --out-dir outputs/runs/cylinder2d_surface/baseline_classical_ridge_lse
+
+    python -u -m methods.classical.anchors_2d \
+        --h5 "$H5" \
+        --train-frames 1200 --fields Ux Uy p --cond-fields 0 1 \
+        --methods idw --idw-k 8 --idw-power 1 2 3 \
+        --n-frames 50 --stratify-blocks 2 --no-periodic --tag idw_power_1pct \
+        --out-dir outputs/runs/cylinder2d/baseline_classical
+
+    python -u -m methods.classical.anchors_2d \
+        --h5 $FRB_ROOT/data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5 \
+        --train-frames 2560 --fields vorticity --cond-fields 0 \
+        --methods idw --idw-k 8 --idw-power 1 2 3 \
+        --n-frames 50 --periodic --tag idw_power_1pct_periodic \
+        --out-dir outputs/runs/kolmogorov2d/baseline_classical
+
+    echo "classical ridge/lse/idw-power done"
+run_classical_lse:
+  purpose: LSE (ridge map from readings to the full field, refitted per sensor layout) on the cylinder, Kolmogorov
+    (1 % and the density sweep) and JHTDB.
+  sbatch:
+    time: 03:00:00
+    mem: 240G
+    cpus: 16
+    gpus: 1
+  body: |
+    # JHTDB on the 50-snapshot canonical draw, split into TUNE / TEST by parity in analysis.paired_ci_jhu.
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    FNO=$(readlink -f "$(ls -d outputs/runs/JHU/baseline_fno/fno3d_xcube_DemoN90_* | tail -1)")   # dataset statistics
+    RC=0
+    echo "##### cylinder volume"
+    python -u -m methods.classical.anchors_2d --h5 $FRB_ROOT/data/cylinder2d/Cylinder2D_mesh.h5 \
+      --train-frames 1200 --fields Ux Uy p --cond-fields 0 1 --methods lse \
+      --n-frames 50 --stratify-blocks 2 --no-periodic --tag main_lse_1pct \
+      --out-dir outputs/runs/cylinder2d/baseline_classical || RC=1
+    echo "##### kolmogorov 1%"
+    python -u -m methods.classical.anchors_2d --h5 $FRB_ROOT/data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5 \
+      --train-frames 2560 --fields vorticity --cond-fields 0 --methods lse \
+      --n-frames 50 --no-periodic --tag main_lse_1pct \
+      --out-dir outputs/runs/kolmogorov2d/baseline_classical || RC=1
+    echo "##### kolmogorov sweep"
+    python -u -m methods.classical.anchors_2d --h5 $FRB_ROOT/data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5 \
+      --train-frames 2560 --fields vorticity --cond-fields 0 --methods lse \
+      --n-sensors 65 164 655 1965 6554 --n-frames 50 --no-periodic --tag sweep_lse \
+      --out-dir outputs/runs/kolmogorov2d/baseline_classical || RC=1
+    echo "##### jhu"
+    python -u -m methods.classical.anchors_jhu --methods lse --run-dir "$FNO" --eval-split val \
+      --n-obs 19531 --n-snapshots 50 --tag oldraw_lse_n19531 --out-dir outputs/rescore_jhu/classical || RC=1
+    echo "exit $RC"; exit $RC
+run_classical_jhu:
+  purpose: JHTDB sensor fingerprints and the anchors' sensor-count sweep (0.1-10 %) on the TEST half (density figure,
+    classical diagnostics).
+  sbatch:
+    time: 04:00:00
+    mem: 96G
+    cpus: 16
+    gpus: 1
+  body: |
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    OUT=outputs/runs/JHU/baseline_classical
+    L=$FRB_LOGS/classical_anchor_${SLURM_JOB_ID}.log
+    {
+      nvidia-smi -L
+      echo "##### sensor fingerprints (canonical helpers.build_sparse_condition, cuda:0)"
+      python -u -m methods.classical.sensor_fingerprints --out $OUT/sensor_fingerprints.json
+      # frozen protocol: the TEST half (25 frames); stats from any run trained on the
+      # same split (the FNO3D run here), SPLIT=tune for selection sweeps
+      RUN_DIR=${RUN_DIR:-$(ls -d outputs/runs/JHU/baseline_fno/fno3d_xcube_DemoN90_* | tail -1)}
+      SPLIT=${SPLIT:-test}
+      echo "##### sensor-count sweep"
+      python -u -m methods.classical.anchors_jhu --methods kdtree idw gappy_pod \
+          --run-dir "$RUN_DIR" --eval-split $SPLIT \
+          --n-obs 1953 4883 9766 19531 39062 97656 195312 --n-snapshots 25 \
+          --tag sweep --out-dir $OUT
+      echo "ALL DONE"
+    } >> $L 2>&1
+rescore_classical_jhu:
+  purpose: JHTDB anchors (training mean, nearest neighbour, IDW, gappy POD r80) and the IDW band pass on all 50
+    held-out snapshots of the canonical draw (main-text rows).
+  sbatch:
+    time: 04:00:00
+    mem: 240G
+    cpus: 16
+    gpus: 1
+  body: |
+    # The 50-snapshot canonical draw (seed*777 + held-out index); analysis.paired_ci_jhu splits it
+    # into TUNE (odd) / TEST (even).
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    O=outputs/rescore_jhu/classical
+    FNO=$(readlink -f "$(ls -d outputs/runs/JHU/baseline_fno/fno3d_xcube_DemoN90_* | tail -1)")   # dataset statistics
+    RC=0
+    python -u -m methods.classical.anchors_jhu --methods constant kdtree idw gappy_pod --run-dir "$FNO" \
+      --eval-split val --n-obs 19531 --n-snapshots 50 --verify-percentile --tag oldraw_main_n19531 --out-dir $O || RC=1
+    python -u -m methods.classical.anchors_jhu --methods idw --run-dir "$FNO" --eval-split val --n-obs 19531 \
+      --n-snapshots 50 --band-metrics --tag oldraw_idw_band --out-dir $O || RC=1
+    echo "exit $RC"; exit $RC

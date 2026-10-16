@@ -1,0 +1,101 @@
+# =============================================================================
+# DeepONet++ (structured branch) -- ICLR cross-cube JHU arm.
+#
+# Labelled enhanced variant per PLAN_IMPROVE_2026-08-30 SS2; the vanilla
+# upstream-faithful DeepONet row (config_baseline_DeepONet_iclr.yaml) stays in
+# the table as the faithful reference.  Rationale: the vanilla global-mean-pool
+# branch is a 736-scalar spatially-unstructured bottleneck -> near-constant
+# predictions (Ux 0.593 / Uz 0.652 at n=50).  This arm replaces the branch
+# aggregation (multiresolution binned pooling 1+4^3+8^3 + per-field Fourier
+# moments) and the trunk (RFF-MLP), keeps everything else protocol-identical.
+#
+# Shared protocol (identical for every baseline):
+#   data     JHU_4cubes_stride100.h5, 125^3, fields (Ux,Uy,Uz,p)
+#   split    JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0, train_ratio 0.75
+#            -> train = 150 snapshots (cubes 0-2), val = 50 (cube 3)
+#   augment  JHU_AUGMENT=octahedral (train only)
+#   sensors  per-channel independent masks on Ux (0) and Uz (2) only,
+#            uniform torch.randint over 1953..19531 = 0.1%..1% of 1,953,125
+#   stats    per-field standardisation from the TRAIN split only
+#
+# Selection/tuning hygiene (PLAN_IMPROVE_2026-08-30):
+#   best.pt   = fixed-mask TUNE validation optimum (canonical seed-0 masks,
+#               19,531/channel, odd cube-3 snapshots {1,3,...,49})
+#   stopping  = patience on that metric; BASELINE_MAX_HOURS=19.5 backstop
+# =============================================================================
+
+baseline_model: "deeponet"
+training_stage: 1
+
+shared:
+  demo_num: 60
+  seed: 42
+  device_ids: [0]
+  reload: false                # never resume; a fresh run dir every launch
+
+  paths:
+    data_path: "data/JHU_4cubes_stride100.h5"
+    save_root: "outputs/runs/JHU/baseline_deeponetpp"
+    config_backup_root: "configs/backup/isotropic_turbulence/det_baseline"
+
+  data:
+    dataset_name: "turbulent_combustion"
+    train_ratio: 0.75
+    time_stride: 1
+    num_workers: 4
+    num_x: 125
+    num_y: 125
+    num_z: 125
+    field_names: [Ux, Uy, Uz, p]
+
+  conditioning:
+    cond_fields: [0, 2]          # Ux and Uz observed; Uy and p fully unobserved
+    n_obs_min_list: [1953]       # 0.1% of 1,953,125, broadcast to both fields
+    n_obs_max_list: [19531]      # 1.0%
+    vis_cond_fields: [0, 2]
+    vis_n_obs_list: [19531, 19531]
+
+  logging:
+    eval_every: 5
+    n_figures: 30                # wall-clock cadence, budget / n_figures
+
+# key kept as `deeponet_params` so eval_deeponetpp.py can reuse the canonical
+# eval_deeponet_iclr.py driver unchanged (it reads this key from run_config).
+deeponet_params:
+  training:
+    epochs: 2000000              # terminated by early stop or wall backstop
+    batch_size: 20               # 8 steps/epoch, same as the vanilla arm
+    learning_rate: 1.0e-3        # upstream: plain Adam, constant, no wd
+    weight_decay: 0.0
+    grad_clip:                   # null = upstream (deepxde applies none)
+    grad_norm_log_every: 25
+    eval_every: 40               # fixed-mask full-field validation is ~30 s;
+                                 # every 40 epochs keeps its overhead <~10%
+    n_query_points: 19531        # queries per snapshot per step (1% of grid)
+    patience_evals: 60           # early stop: 60 fixed-val evals (=2400
+                                 # epochs) without improvement
+    fixed_val:
+      seed: 0                    # canonical seed-0 masks
+      n_obs: 19531               # 1% per conditioned channel
+      cond_fields: [0, 2]
+
+  architecture:
+    # Parameter-matched to 6,506,253 +/-10%, counted by building:
+    # p=640/merge_width=588 (see deeponetpp.py __main__ for the count)
+    n_fields: 4
+    coord_dim: 3
+    p: 640                       # p-sweep arm (TUNE-split selection)
+    field_embed_dim: 32
+    # -- structured branch ------------------------------------------------
+    phi_width: 384               # per-sensor FNN width (2 hidden layers)
+    d_global: 256                # feature chunk pooled globally (1^3)
+    bin_resolutions: [4, 8]      # multiresolution occupancy-weighted bins
+    bin_feat_dims: [24, 6]       # feature chunk per bin resolution
+    fourier_kmax: 4              # 4^3=64 integer modes, re+im, per field
+    merge_width: 588             # rebalanced to stay in the param band
+    # -- RFF trunk --------------------------------------------------------
+    rff_freqs: 128               # gamma(x)=[cos,sin](2 pi B x), B ~ N(0,8^2)
+    rff_sigma: 8.0
+    rff_seed: 1234               # B drawn once, persisted in the checkpoint
+    trunk_width: 768
+    trunk_layers: 3              # 2 hidden + output; output ACTIVATED (upstream)

@@ -1,0 +1,113 @@
+# =============================================================================
+# PoF-benchmark 2D cylinder (native mesh, 23800 cells, D=1 at origin) — DMF-Gen
+# (point-cloud rectified flow, GL_rbf_ENH backbone as frozen for the fleet).
+# Protocol identical to the baseline configs in this directory:
+# JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 (set by the launcher), train_ratio
+# 0.6667 = frames [0,1200) train Re{60,100,150,200} / [1200,1800) held-out
+# Re{80,250} (Re-holdout, not temporal holdout). Sensors 0.1-2% per observed
+# field; p is NEVER observed (cond_fields [0,1] only) — the 2D identifiability
+# probe: can pressure be recovered from sparse velocity alone?
+# No augmentation: the wake breaks y-reflection symmetry per-frame.
+# spectral_weight 0 — the mesh is unstructured, no verified block cut.
+# Budget: bs 20 -> 60 steps/epoch -> 850 epochs = 51k steps (~fleet-matched).
+# =============================================================================
+
+Demo_Num: 996
+device_ids: [0]
+
+data: "data/cylinder2d/Cylinder2D_mesh.h5"
+save_dir: "outputs/runs/_legacy/smoke_cyl_ffm"
+
+seed : 42
+epochs : 3
+batch_size : 20
+lr : 1.0e-4
+weight_decay : 1.0e-6
+train_ratio : 0.6667
+time_stride : 1
+num_workers : 4
+field_names: ["Ux", "Uy", "p"]
+
+backbone: "GL_rbf_ENH"
+
+hidden_dim : 256
+cond_dim : 128
+field_embed_dim : 128
+sigma_min : 1.0e-4
+rbf_sigma : 0.05
+
+USE_FOURIER_PE: true
+fourier_pe_num_bands: 32
+fourier_pe_max_freq: 64.0
+
+latent_dim: 256
+num_latents: 128
+num_heads: 8
+num_latent_blocks: 4
+ff_mult: 4
+attn_dropout: 0.0
+mlp_dropout: 0.0
+decode_chunk_size: 4096
+share_query_proj: false
+
+summary_type: "mean"
+
+gather_mode: "topk_rbf_glres"
+gather_topk: 16
+sensor_local_topk: 16
+gather_query_chunk_size: 2048
+learnable_rbf_sigma: true
+neighbor_backend: "keops"
+sensor_local_dropout: 0.0
+
+sensor_coord_encoding: "fourier"
+latent_sensor_reinject: true
+latent_reinject_every: 1
+query_latent_readout: true
+query_readout_type: "coord"
+query_readout_scale_init: 1.0e-2
+enhanced_head_norm: true
+glres_scale_init: 1.0e-2
+
+Num_x: 400                   # FNO conditioning block only (rasterized obs grid);
+Num_y: 200                   # matches the 200x400 ROI companion grid aspect
+fno_modes_x: 32
+fno_modes_y: 32
+fno_hidden_channels: 64
+fno_n_layers: 4
+condition_blur: true
+condition_blur_kernel: 15
+condition_blur_sigma: 2.5
+
+n_query_points : 476         # 2% of 23800 mesh cells, mirroring the JHU 2%-query budget
+query_sampling: "uniform"
+query_sample_near_ratio: 0.25
+query_sample_far_ratio: 0.25
+query_sample_sigma_ratio: 0.05
+prior : "rff"
+rff_features : 256
+rff_lengthscale : 0.05       # near-wake shear layers are thin relative to the 33x16 domain
+
+eval_every : 5
+save_every : 1000000         # in-training visualization assumes the JHU grid; evals are offline
+n_steps_generation : 32
+
+cond_fields :   [0, 1]       # ["Ux", "Uy", "p"] — velocities observed, p never observed
+n_obs_min_list: [24]         # 0.1% of 23800, broadcast to both velocity fields
+n_obs_max_list: [476]        # 2%
+
+vis_cond_fields:
+vis_n_obs_list: [238]        # selection draw at the evaluation count (protocol)
+
+ode_solver : "euler"
+benchmark_n_steps : [2, 4, 16]
+
+use_amp: true
+ema_decay: 0.9995
+
+t_sampling: "logit_normal"
+compile_model: false
+
+spectral_weight: 0.0
+spectral_block: 32
+spectral_bins: 12

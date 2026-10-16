@@ -1,0 +1,82 @@
+baseline_model: sit
+training_stage: 1
+shared:
+  demo_num: 41
+  seed: 42
+  device_ids:
+  - 0
+  reload: false
+  paths:
+    data_path: data/JHU_4cubes_stride100.h5
+    save_root: outputs/runs/JHU/baseline_sit/matched
+    config_backup_root: configs/backup/isotropic_turbulence
+  data:
+    dataset_name: turbulent_combustion
+    field_names:
+    - Ux
+    - Uy
+    - Uz
+    - p
+    train_ratio: 0.75
+    time_stride: 1
+    num_workers: 4
+    num_x: 125
+    num_y: 125
+    num_z: 125
+  conditioning:
+    cond_fields:
+    - 0
+    - 2
+    n_obs_min_list:
+    - 1953
+    n_obs_max_list:
+    - 19531
+    vis_cond_fields:
+    - 0
+    - 2
+    vis_n_obs_list:
+    - 19531
+  logging:
+    eval_every: 5
+    save_every: 200
+  overrides:
+    epochs: null
+    batch_size: null
+    learning_rate: null
+    weight_decay: null
+sit_params:
+  training:
+    epochs: 5500
+    batch_size: 24
+    learning_rate: 5.0e-05
+    weight_decay: 0.0001
+    eval_every: 5
+    save_every: 200
+    archive_from: 5225
+    archive_every: 25
+    adam_eps: 1.0e-06
+    huber_beta: 0.0
+  architecture:
+    patch_size: 4
+    hidden_size: 240
+    depth: 6
+    num_heads: 4
+    mlp_ratio: 4.0
+    tokenizer: pointnet
+    coord_dim: 3
+    fourier_num_freqs: 64
+    fourier_scale: 10.0
+    ema_rate: 0.9999
+    node_subsample: 8192
+    cond_fill_sigma: 0.05
+  transport:
+    path_type: Linear
+    prediction: velocity
+    loss_weight: null
+  conditioning:
+    cond_mode: interp
+  sampling:
+    sampling_N: 32
+    ode_solver: euler
+    benchmark_n_steps:
+    - 32

@@ -1,0 +1,37 @@
+# Site (cluster) settings for FlowReconBench. Everything machine-specific lives here;
+# the code and the launcher cases never hard-code accounts, partitions or paths.
+# Override any key with an environment variable FRB_<KEY>, e.g. FRB_ACCOUNT=...
+#
+# This file describes NCSA DeltaAI (GH200 nodes); the `kestrel` profile describes NREL
+# Kestrel (H100 nodes).
+
+# ---- SLURM ---------------------------------------------------------------------------
+account: bilr-dtai-gh
+partition: ghx4
+gpu_gres: gpu:1
+mail_user: ""                 # e.g. user@example.edu (mail-type END,FAIL when set)
+
+# ---- Python environment --------------------------------------------------------------
+# A line that is `source`d at the top of every job (activates the environment).
+env_activate: "source ~/envs/jhtdb"
+
+# ---- Datasets (relative paths resolve against the repository root) --------------------
+kolmogorov2d_h5: data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5
+cylinder2d_mesh_h5: data/cylinder2d/Cylinder2D_mesh.h5
+jhu_h5: data/JHU_4cubes_stride100.h5
+kolmogorov_shu_npy: data/kolmogorov_shu.npy
+
+# ---- Upstream checkouts (git submodules under third_party/) ---------------------------
+confild_root: third_party/CoNFiLD
+gen4turb_root: third_party/Gen4Turbulence
+s3gm_root: third_party/S3GM
+phycoflow_mfr_root: third_party/PhyCoFlow-MultiFieldReconstruction   # upstream DMF-Gen (Kolmogorov row)
+
+# ---- Alternative site profiles (select with FRB_PROFILE=<name>) ----------------------
+profiles:
+  kestrel:                    # NREL Kestrel (H100 nodes); FRB_PROFILE=kestrel
+    account: ammoniacomb
+    partition: gpu-h100       # 2-day cap; gpu-h100s (4 h) for smoke jobs: SMOKE_PARTITION=gpu-h100s
+    gpu_gres: gpu:h100:1
+    env_activate: "source ~/venvs/jhtdb_env/bin/activate; module load cuda/12.9"   # pyKeOps needs the module's nvrtc
+    time_cap: "2-00:00:00"

@@ -1,0 +1,78 @@
+baseline_model: senseiver
+training_stage: 1
+shared:
+  demo_num: 43
+  seed: 42
+  device_ids:
+  - 0
+  reload: false
+  paths:
+    data_path: data/JHU_4cubes_stride100.h5
+    save_root: outputs/runs/JHU/baseline_senseiver
+    config_backup_root: configs/backup/isotropic_turbulence
+  data:
+    dataset_name: turbulent_combustion
+    train_ratio: 0.75
+    time_stride: 1
+    num_workers: 4
+    num_x: 125
+    num_y: 125
+    num_z: 125
+    field_names:
+    - Ux
+    - Uy
+    - Uz
+    - p
+  conditioning:
+    cond_fields:
+    - 0
+    - 2
+    n_obs_min_list:
+    - 1953
+    n_obs_max_list:
+    - 19531
+    vis_cond_fields:
+    - 0
+    - 2
+    vis_n_obs_list:
+    - 19531
+    - 19531
+  logging:
+    eval_every: 5
+    save_every: 250
+  overrides:
+    epochs: null
+    batch_size: null
+    learning_rate: null
+    weight_decay: null
+senseiver_params:
+  training:
+    epochs: 200000
+    batch_size: 20
+    optimizer: upstream
+    learning_rate: 0.0001
+    weight_decay: 0.0
+    grad_clip: null
+    grad_norm_log_every: 10
+    eval_every: 5
+    save_every: 250
+    n_query_points: 19531
+  architecture:
+    upstream_layout: true
+    share_encoder_layers: true
+    ff_mult: 1
+    dropout: 0.0
+    num_encoder_layers: 3
+    num_self_attn_per_block: 3
+    num_cross_attn_heads: 2
+    num_self_attn_heads: 2
+    dec_num_cross_attn_heads: 1
+    space_bands: 32
+    dec_preproc_ch: null
+    coord_dim: 3
+    max_freq: null
+    latent_dim: 320
+    enc_preproc_ch: 320
+    dec_latent_dim: 320
+    num_latents: 64
+    field_embed_dim: 32

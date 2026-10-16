@@ -1,0 +1,123 @@
+# SEED REPLICATE (seed 1337) of configs/kolmogorov2d/config_baseline_Det_kolm.yaml -- identical otherwise.
+# =============================================================================
+# PoF-benchmark 2D Kolmogorov (Shu et al., 256^2 vorticity, 40 trajectories)
+# Deterministic baselines. Trajectory-holdout protocol: frames [0,2560) = 32
+# train trajectories, [2560,3200) = 8 held-out trajectories; launchers must set
+# JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 and train_ratio 0.8 to reproduce it.
+# Sensor budget mirrors the JHU fractional protocol: 0.1-10% of 65536 points.
+# Budget target ~50k optimizer steps (bs 128 -> 20 steps/epoch -> 2500 epochs).
+# =============================================================================
+
+baseline_model: "senseiver"  # `mlp_rbf`, `senseiver`, or `geofno`
+training_stage: 1
+
+shared:
+  demo_num: 261
+  seed: 1337
+  device_ids: [0]
+  reload: true
+
+  paths:
+    data_path: "data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5"
+    save_root: "outputs/runs/kolmogorov2d_seed1337/baseline_det"
+    config_backup_root: "configs/kolmogorov2d_seed1337/det_baseline"
+
+  data:
+    dataset_name: "kolmogorov2d"
+    train_ratio: 0.8
+    time_stride: 1
+    num_workers: 4
+    num_x: 256
+    num_y: 256
+    field_names: ["vorticity"]
+
+  conditioning:
+    cond_fields: [0]           # vorticity (single-channel dataset)
+    n_obs_min_list: [65]       # 0.1% of 256^2
+    n_obs_max_list: [6554]      # 10%
+    vis_cond_fields: [0]
+    vis_n_obs_list: [655]
+
+  logging:
+    eval_every: 5
+    save_every: 500
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+mlp_rbf_params:
+  training:
+    epochs: 2500
+    batch_size: 128
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+    n_query_points: 4096
+
+  architecture:
+    coord_dim: 2
+    hidden_dim: 256
+    cond_dim: 128
+    field_embed_dim: 128
+    rbf_sigma: 0.05
+    use_fourier_pe: true
+    fourier_pe_num_bands: 32
+    fourier_pe_max_freq: 64.0
+
+senseiver_params:
+  training:
+    epochs: 2500
+    batch_size: 128
+    optimizer: upstream          # plain Adam, constant LR, no weight decay (network_light.py:78)
+    learning_rate: 1.0e-4
+    weight_decay: 0.0
+    grad_clip: null
+    grad_norm_log_every: 10
+    eval_every: 5
+    save_every: 500
+    n_query_points: 4096
+
+  architecture:                  # the JHU Senseiver (config_baseline_Senseiver_iclr.yaml) at coord_dim 2: 6.11 M
+    upstream_layout: true
+    share_encoder_layers: true
+    coord_dim: 2
+    num_latents: 64
+    latent_dim: 320
+    enc_preproc_ch: 320
+    dec_latent_dim: 320
+    dec_preproc_ch: null
+    num_encoder_layers: 3
+    num_self_attn_per_block: 3
+    num_cross_attn_heads: 2
+    num_self_attn_heads: 2
+    dec_num_cross_attn_heads: 1
+    field_embed_dim: 32
+    space_bands: 32
+    max_freq: null               # per-axis top frequency from num_x / num_y (positional.py:18-22)
+    ff_mult: 1
+    dropout: 0.0
+
+geofno_params:
+  training:
+    epochs: 2500
+    batch_size: 32
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+
+  architecture:
+    geofno_variant: "fno"
+    fno_modes_x: 32
+    fno_modes_y: 32
+    fno_hidden_channels: 64
+    fno_n_layers: 4
+
+    latent_Nx: 64
+    latent_Ny: 64
+    gno_radius: 0.1
+    gno_transform_type: "linear"

@@ -1,0 +1,116 @@
+# Deterministic FNO3D on the JHU cross-cube protocol: the FNO3D row's backbone, inputs,
+# optimizer, schedule (6000 epochs at batch 8), EMA and precision, trained by MSE regression
+# of the field (objective: regression, methods.dmfgen.fno3d_backbone.FNO3DRegression) instead of
+# flow matching, so the pair isolates the training objective. The spectral loss is off because
+# it acts on the flow's endpoint estimate. Selection: TUNE half, fixed-seed masks (protocol).
+# Launch: train_iclr_jhu_xcube_aug --variant train_fno3d_det_xcube.
+Demo_Num: 97
+device_ids:
+- 0
+data: data/JHU_4cubes_stride100.h5
+save_dir: outputs/runs/JHU/baseline_fno/fno3d_det_xcube
+field_names:
+- Ux
+- Uy
+- Uz
+- p
+backbone: fno3d
+objective: regression
+seed: 42
+epochs: 6000
+batch_size: 8
+lr: 0.0001
+weight_decay: 1.0e-06
+train_ratio: 0.75
+time_stride: 1
+num_workers: 4
+hidden_dim: 256
+cond_dim: 128
+field_embed_dim: 128
+rbf_sigma: 0.05
+USE_FOURIER_PE: true
+fourier_pe_num_bands: 32
+fourier_pe_max_freq: 64.0
+latent_dim: 256
+num_latents: 128
+num_heads: 8
+num_latent_blocks: 4
+ff_mult: 4
+attn_dropout: 0.0
+mlp_dropout: 0.0
+decode_chunk_size: 4096
+share_query_proj: false
+summary_type: mean
+gather_mode: topk_rbf_glres
+gather_topk: 16
+spectral_weight: 0.0
+spectral_block: 32
+spectral_bins: 12
+gather_multiscale: false
+gather_topk_coarse: 64
+gather_coarse_sigma_scale: 4.0
+gather_query_chunk_size: 2048
+learnable_rbf_sigma: true
+neighbor_backend: keops
+sensor_local_topk: 16
+sensor_local_dropout: 0.0
+sensor_coord_encoding: fourier
+latent_sensor_reinject: true
+latent_reinject_every: 1
+query_latent_readout: true
+query_readout_type: coord
+query_readout_scale_init: 0.01
+enhanced_head_norm: true
+glres_scale_init: 0.01
+Num_x: 125
+Num_y: 125
+Num_z: 125
+fno_modes_z: 16
+fno_domain_padding: null
+fno_modes_x: 16
+fno_modes_y: 16
+fno_hidden_channels: 27
+fno_n_layers: 4
+condition_blur: true
+condition_blur_kernel: 15
+condition_blur_sigma: 2.5
+n_query_points: 39062
+query_sampling: uniform
+query_sample_near_ratio: 0.25
+query_sample_far_ratio: 0.25
+query_sample_sigma_ratio: 0.05
+prior: rff
+prior_slope: 1.6666666666666667
+prior_k_min: 1.0
+prior_k_max: 48.0
+spectral_window: true
+rff_features: 256
+rff_lengthscale: 0.15
+sigma_min: 0.0001
+cond_field: 2
+n_obs_min: 64
+n_obs_max: 256
+cond_fields:
+- 0
+- 2
+n_obs_min_list:
+- 1953
+n_obs_max_list:
+- 19531
+vis_cond_fields:
+- 0
+- 2
+vis_n_obs_list:
+- 19531
+ode_solver: euler
+benchmark_n_steps:
+- 1
+eval_every: 5
+save_every: 200
+n_steps_generation: 32
+use_amp: true
+t_sampling: logit_normal
+compile_model: false
+ema_decay: 0.9995
+measurement_ops: null
+dataset: jhu

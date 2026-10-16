@@ -1,0 +1,223 @@
+# Field dumps behind the galleries and spectra figures, and the CPU step that writes every table, figure and JSON of the paper into outputs/paper/.
+# python -m launch submit <case> [--variant <name>]; python -m launch list figures
+
+dump_2d_gallery:
+  purpose: Kolmogorov (TEST position 128) and cylinder (150) field dumps of the reported runs at their TUNE-chosen
+    settings, and of the classical anchors, on the canonical sensor draw.
+  sbatch:
+    time: 02:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -uo pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    KOLM=$FRB_ROOT/outputs/runs/kolmogorov2d
+    CYL=$FRB_ROOT/outputs/runs/cylinder2d
+    OUT=$FRB_ROOT/outputs/pof/field_dumps
+    mkdir -p "$OUT"
+    FAIL=0
+    run_dump () {  # $1 tag; rest: fleet_2d args
+      local TAG=$1; shift
+      echo "##### $TAG start $(date +%T)"
+      python -m eval.fleet_2d "$@" --dump-npz "$OUT/$TAG.npz" || { echo "##### $TAG FAILED"; FAIL=1; }
+    }
+    latest () { readlink -f "$(ls -d $1 | tail -1)"; }
+    # ---------------- Kolmogorov, test-half frame 128, 655 vorticity sensors ----------------
+    K="--dump-frame 128 --n-obs-list 655 --cond-fields 0 --expect-val-len 320 --seed 0 --K 8"
+    run_dump kolm_latent_fm --model latent_fm --run-dir "$(latest "$KOLM/baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN60_*")" --ckpt best --nfe 4 $K
+    run_dump kolm_s3gm      --model s3gm      --run-dir "$(latest "$KOLM/baseline_s3gm/Baseline_s3gm_Stage1_DemoN63_*")" --ckpt best --nfe 1000 --s3gm-sampler upstream --s3gm-alpha-case 0.3 $K
+    run_dump kolm_senseiver --model senseiver --run-dir "$(latest "$KOLM/baseline_det/Baseline_senseiver_Stage1_DemoN61_*")" --ckpt best $K
+    run_dump kolm_mlprbf    --model mlp_rbf   --run-dir "$(latest "$KOLM/baseline_mlp_rbf/Baseline_mlp_rbf_Stage1_DemoN564_*")" --ckpt best $K
+    run_dump kolm_geofno    --model geofno    --run-dir "$(latest "$KOLM/baseline_geofno/Baseline_geofno_Stage1_DemoN65_*")" --ckpt best $K
+    # ---------------- Cylinder, test-half frame 150 (first Re 250 frame), Ux,Uy at 238 ------
+    C="--dump-frame 150 --n-obs-list 238 --cond-fields 0 1 --expect-val-len 300 --seed 0 --K 8"
+    run_dump cyl_dmfgen_b128 --model dmfgen   --run-dir "$(latest "$CYL/pointcloud_ffm_v1_b128/bench_cyl_v1_b128_DemoN122_*")" --ckpt last --nfe 8 $C
+    run_dump cyl_senseiver  --model senseiver --run-dir "$(latest "$CYL/baseline_det/Baseline_senseiver_Stage1_DemoN71_*")" --ckpt best $C
+    run_dump cyl_mlprbf     --model mlp_rbf   --run-dir "$(latest "$CYL/baseline_mlp_rbf/Baseline_mlp_rbf_Stage1_DemoN572_*")" --ckpt best $C
+    run_dump cyl_geofno     --model geofno    --run-dir "$(latest "$CYL/baseline_geofno_mesh/Baseline_geofno_Stage1_DemoN*")" --ckpt best $C
+    # ---------------- classical anchors on the same frames and draws ----------------------------
+    for DS in kolmogorov2d cylinder2d; do python -u -m figures.dump_classical_gallery --dataset $DS || FAIL=1; done
+    ls -la "$OUT"
+    exit $FAIL
+dump_surface_gallery:
+  purpose: Surface-task field dumps (TEST frame 150, 128 taps per field) of the reported runs and the classical
+    anchors.
+  sbatch:
+    time: 01:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -uo pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    S=$FRB_ROOT/outputs/runs/cylinder2d_surface
+    OUT=$FRB_ROOT/outputs/pof/field_dumps
+    mkdir -p "$OUT"
+    FAIL=0
+    run_dump () { local TAG=$1; shift; echo "##### $TAG $(date +%T)"; python -m eval.fleet_2d "$@" --dump-npz "$OUT/$TAG.npz" || { echo "##### $TAG FAILED"; FAIL=1; }; }
+    latest () { readlink -f "$(ls -d $1 | tail -1)"; }
+    C="--dump-frame 150 --n-obs-list 128 --cond-fields 0 1 2 --cond-source surface --expect-val-len 300 --seed 0 --K 8"
+    run_dump cylsurf_dmfgen_b128 --model dmfgen  --run-dir "$(latest "$S/pointcloud_ffm_v1_b128/bench_cyl_surface_v1_b128_DemoN123_*")" --ckpt last --nfe 8 $C
+    run_dump cylsurf_senseiver --model senseiver --run-dir "$(latest "$S/baseline_det/Baseline_senseiver_Stage1_DemoN81_*")" --ckpt best $C
+    run_dump cylsurf_mlprbf    --model mlp_rbf   --run-dir "$(latest "$S/baseline_mlp_rbf/Baseline_mlp_rbf_Stage1_DemoN582_*")" --ckpt best $C
+    run_dump cylsurf_geofno    --model geofno    --run-dir "$(latest "$S/baseline_geofno_mesh/Baseline_geofno_Stage1_DemoN89_*")" --ckpt best $C
+    python -u -m figures.dump_classical_gallery --dataset cylinder2d_surface || FAIL=1
+    ls -la "$OUT" | grep cylsurf
+    exit $FAIL
+dump_sit_2d:
+  purpose: SiT-point field dumps with the per-step sampler at the TUNE-chosen N and weights (Kolmogorov N=32 raw,
+    cylinder N=8 EMA, surface N=8 raw).
+  sbatch:
+    time: 00:30:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -uo pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    OUT=$FRB_ROOT/outputs/pof/field_dumps
+    mkdir -p "$OUT"
+    RUNS=$FRB_ROOT/outputs/runs
+    FAIL=0
+    run_dump () {  # $1 tag, $2 TUNE-half NFE; rest: fleet_2d args
+      local TAG=$1 NFE=$2; shift 2
+      python -m eval.fleet_2d "$@" --model sit --ckpt best --nfe $NFE --seed 0 --K 8 --dump-npz "$OUT/$TAG.npz" || FAIL=1
+    }
+    run_dump kolm_sit 32   --run-dir "$(ls -d $RUNS/kolmogorov2d/baseline_sit_point/Baseline_sit_Stage1_DemoN67_* | tail -1)" ${KOLM_W---raw-weights} \
+      --dump-frame 128 --n-obs-list 655 --cond-fields 0 --expect-val-len 320
+    run_dump cyl_sit 8     --run-dir "$(ls -d $RUNS/cylinder2d/baseline_sit_point/Baseline_sit_Stage1_DemoN77_* | tail -1)" ${CYL_W-} \
+      --dump-frame 150 --n-obs-list 238 --cond-fields 0 1 --expect-val-len 300
+    run_dump cylsurf_sit 8 --run-dir "$(ls -d $RUNS/cylinder2d_surface/baseline_sit_point/Baseline_sit_Stage1_DemoN87_* | tail -1)" ${SURF_W---raw-weights} \
+      --dump-frame 150 --n-obs-list 128 --cond-fields 0 1 2 --cond-source surface --expect-val-len 300
+    exit $FAIL
+dump_jhu_frame152:
+  purpose: JHTDB gallery and spectra dumps on TEST frame 152 for every method, on the sensors of the SiT-point reference
+    dump (Senseiver and latent FM draw their own; the indices are checked at the end).
+  sbatch:
+    time: 02:00:00
+    mem: 240G
+    cpus: 16
+    gpus: 1
+  body: |
+    set -uo pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 JHU_AUGMENT=
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MPLCONFIGDIR=/tmp TQDM_DISABLE=1
+    J=$FRB_ROOT/outputs/runs/JHU
+    JHU_H5=$FRB_ROOT/data/JHU_4cubes_stride100.h5
+    FD=$FRB_ROOT/outputs/pof/field_dumps/frame152
+    REF=$FD/jhu_sit.npz
+    PROT="--frame 152 --sensor-seed 102 --cond-fields 0 2 --n-obs 19531"
+    mkdir -p $FD
+    RC=0
+    run () {  # $1 dump name; the rest is the command
+      local TAG=$1; shift
+      if [ -s $FD/$TAG.npz ]; then echo "##### $TAG present, skip"; return 0; fi
+      echo "##### $TAG $(date +%T)"
+      "$@" || { echo "##### $TAG FAILED"; RC=1; }
+    }
+    run jhu_sit python -u -m figures.dump_fields_baseline --method sit \
+        --run-dir $J/baseline_sit/matched/Baseline_sit_Stage1_DemoN41_20260828_181938 --ckpt last --rechunk \
+        --split val $PROT --K 1 --out $REF
+    [ -s $REF ] || { echo "no reference dump"; exit 1; }
+    DMF_NFE=${DMF_NFE:-2}   # TUNE choice of the reported row
+    if [ -n "$DMF_NFE" ]; then
+      run jhu_dmfgen python -u -m figures.dump_jhu_gallery --frame 152 --sensor-seed 102 --dump-dir $FD \
+          --methods dmfgen --ckpt last.pt --nfe $DMF_NFE
+    else
+      echo "##### jhu_dmfgen NOT RUN: set DMF_NFE"; RC=1
+    fi
+    run jhu_fno3d python -u -m figures.dump_jhu_gallery --frame 152 --sensor-seed 102 --dump-dir $FD \
+        --methods fno3d --ckpt best.pt --nfe 4
+    run jhu_classical python -u -m figures.dump_jhu_gallery --frame 152 --sensor-seed 102 --dump-dir $FD \
+        --methods classical
+    # latent FM and Senseiver draw their own sensors; their idx_sum is checked below
+    run jhu_latent_fm python -u -m figures.dump_fields_baseline --method latent_fm \
+        --run-dir $FRB_ROOT/outputs/runs/JHU/baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN24_20260828_164541 \
+        --ckpt last --split val $PROT --K 1 --n-steps 4 --field-names Ux Uy Uz p --data-path $JHU_H5 \
+        --out $FD/jhu_latent_fm.npz
+    run jhu_senseiver python -u -m figures.dump_fields_baseline --method senseiver \
+        --run-dir $J/baseline_senseiver/Baseline_senseiver_Stage1_DemoN43_20260828_180959 --ckpt budget \
+        --split val $PROT --data-path $JHU_H5 --out $FD/jhu_senseiver.npz
+    run jhu_gen4turb python -u -m figures.dump_gen4turb_field --ckpt models_uxuz_octa_s2027/model_3590.pt \
+        --frame 152 --out $FD/jhu_gen4turb.npz
+    run jhu_s3gm python -u -m methods.s3gm.eval_jhu \
+        --run-dir $J/baseline_s3gm/matched/Baseline_s3gm_Stage1_DemoN94_20260828_224632 --ckpt last --split val \
+        --snaps 2 --K 1 --n-steps 200 --norm-guidance 17.8 5.34 \
+        --cond-fields 0 2 --n-obs 19531 19531 --seed 0 --op-seed 1000 \
+        --sensor-indices-npz $REF --dump-npz $FD/jhu_s3gm.npz --out $FRB_ROOT/outputs/scratch/jhu_s3gm_gallery152_eval.json
+    ARM=$J/baseline_confild/unified_published_prior
+    S1=$(ls -d $ARM/Baseline_confild_Stage1_DemoN23_* | grep -v ABORTED | sort | tail -1)
+    S2=$(ls -d $ARM/Baseline_confild_Stage2_DemoN23_* | grep -v ABORTED | sort | tail -1)
+    mkdir -p $FRB_ROOT/outputs/scratch/confild_gallery
+    run jhu_confild python -u -m methods.confild.eval_unified2 \
+        --stage1-ckpt $S1/best.pt --stage2-ckpt $S2/best.pt --out-dir $FRB_ROOT/outputs/scratch/confild_gallery \
+        --tag gallery152_window1 --window1 --snaps 2 --K 1 --seed 0 --op-seed 1000 --cond-fields 0 2 \
+        --n-obs 19531 19531 --dps-scale 0.1 --steps 1000 --row-chunk 4 --no-figs \
+        --sensor-indices-npz $REF --dump-npz $FD/jhu_confild.npz
+    python - <<'PY'
+    import json, numpy as np
+    fd = "outputs/pof/field_dumps/frame152/"
+    ref = np.load(fd + "jhu_sit.npz"); rs = int(ref["sensor_indices"].sum())
+    print("reference", json.loads(str(ref["meta"]))["absolute_frame"], "idx_sum", rs)
+    for f in ("jhu_dmfgen", "jhu_fno3d", "jhu_classical", "jhu_latent_fm", "jhu_senseiver",
+              "jhu_s3gm", "jhu_confild", "jhu_gen4turb"):
+        try:
+            z = np.load(fd + f + ".npz"); s = int(z["sensor_indices"].sum())
+            same = np.allclose(z["truth"], ref["truth"], rtol=1e-3, atol=1e-3) \
+                if z["truth"].shape == ref["truth"].shape else "own grid"
+            print(f, "idx_sum", s, "MATCH" if s == rs else "DIFFERENT DRAW", "| truth:", same)
+        except Exception as e: print(f, "missing:", e)
+    PY
+    exit $RC
+paper_figures_tables:
+  purpose: CPU - every generated table, figure and JSON of the paper into outputs/paper/ (2D and 3D tables, paired
+    tests, seed variance, recalibration, galleries, spectra, density and scaling figures).
+  sbatch:
+    time: 02:00:00
+    mem: 64G
+    cpus: 8
+    gpus: 0
+  body: |
+    # Inputs: the TEST / TUNE payloads, classical JSONs, outputs/rescore_jhu/ and the field dumps.
+    # Order matters only for the 2D tables, which read cross_re_cylinder.json.
+    set -u
+    P=outputs/paper
+    mkdir -p $P/figures $P/diagnostics $P/recalib
+    RC=0
+    run () { echo "##### $*"; python -u -m "$@" || RC=1; }
+    run analysis.cross_re_cylinder --json $P/cross_re_cylinder.json --tex $P/tab_crossre_body.tex
+    run figures.pof.make_2d_tables
+    run figures.pof.make_surface_table
+    run figures.pof.make_operator_table --json $P/tab_operator.json
+    run analysis.paired_ci_2d
+    run analysis.seed_variance_2d
+    run analysis.audit_train_budgets --json $P/train_budget_audit.json
+    run analysis.paired_ci_jhu
+    # Spread recalibration: one multiplier per generative row, fitted on its TUNE payload and
+    # applied to its TEST payload (TUNE-chosen settings of the reported rows).
+    ev () { echo "$(ls -d outputs/runs/$1 | tail -1)/Evaluation"; }
+    CQ=$(ev "kolmogorov2d/upstream_gl_rbf_cq_range/*"); LFM=$(ev "kolmogorov2d/baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN60_*")
+    SIT=$(ev "kolmogorov2d/baseline_sit_point/Baseline_sit_Stage1_DemoN67_*"); S3=$(ev "kolmogorov2d/baseline_s3gm/Baseline_s3gm_Stage1_DemoN63_*")
+    CSIT=$(ev "cylinder2d/baseline_sit_point/Baseline_sit_Stage1_DemoN77_*"); CDMF=$(ev "cylinder2d/pointcloud_ffm_v1_b128/bench_cyl_v1_b128_DemoN122_*")
+    run calibration.recalibrate_spread \
+      --pair $CQ/kolm_tune_epoch_500_dmfgencq_K8_nfe2.json $CQ/kolm_fleet_dmfgencq_K8_nfe2.json \
+      --pair $LFM/kolm_tune_best_latentfm_K8_nfe4.json $LFM/kolm_fleet_latentfm_K8_nfe4.json \
+      --pair $SIT/kolm_tune_best_raw_sit_K8_nfe32.json $SIT/kolm_fleet_sit_K8_nfe32.json \
+      --pair $S3/kolm_tune_best_upstream_a0.3_s3gm_K8_nfe1000.json $S3/kolm_fleet_s3gm_K8_nfe1000.json \
+      --pair $CSIT/cyl_tune_best_sit_K8_nfe8.json $CSIT/cyl_fleet_sit_K8_nfe8.json \
+      --out $P/recalib/spread_multiplier_tune_test_2d.json
+    run calibration.recalibrate_spread \
+      --pair $CDMF/cyl_tune_last_dmfgen_K8_nfe8.json $CDMF/cyl_fleet_dmfgen_K8_nfe8.json \
+      --out $P/recalib/spread_multiplier_dmfgen_b128.json
+    run figures.pof.fig_gallery_allbaselines kolmogorov_compact cylinder_merged
+    run figures.pof.fig_gallery_jhu_slices
+    run figures.pof.fig_spectra_kolmogorov --compact
+    run figures.pof.fig_spectra_stats --compact
+    run figures.pof.fig_perf_vs_sensors --compact
+    run figures.pof.fig_perf_vs_sensors
+    run figures.pof.fig_scaling_cost_mem --compact
+    run figures.pof.make_headline_figs
+    echo "exit $RC"; exit $RC

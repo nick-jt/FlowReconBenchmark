@@ -1,0 +1,532 @@
+# Evaluation of the 2D rows under the frozen protocol - TUNE-half selection, TEST rows, seed replicates, density sweep, measurement operators, band metrics, probes and CRPS-selected settings.
+# python -m launch submit <case> [--variant <name>]; python -m launch list 2d/eval
+
+submit_2d_eval:
+  purpose: Driver - submits the TUNE sweeps (tune) or every reported TEST evaluation (test) with the sampler settings
+    the TUNE half selected.
+  sbatch:
+    time: 00:10:00
+    mem: 4G
+    cpus: 1
+    gpus: 0
+  body: |
+    # python -m launch run submit_2d_eval tune    # TUNE sweeps; eval.tune_select prints the choices
+    # python -m launch run submit_2d_eval test    # TEST rows at the settings below
+    # The settings are the TUNE-half choices of the reported runs:
+    #   Kolmogorov  SiT-point N=32 raw weights; latent FM best N=4; S3GM N=1000, alpha_case 0.3;
+    #               MLP-RBF rbf_sigma 0.02 (DemoN564); DMF-Gen in eval_kolm_dmfgen_cq
+    #   cylinder    SiT-point N=8 EMA; DMF-Gen last N=8; MLP-RBF rbf_sigma 0.02 (DemoN572)
+    #   surface     SiT-point N=8 raw; DMF-Gen last N=8
+    set -euo pipefail
+    PHASE=${1:?usage: submit_2d_eval tune|test}
+    MAP=$FRB_LOGS/fleet_jobs.txt
+    R=outputs/runs
+    sub() { local label=$1; shift; local jid; jid=$(frb_submit --parsable "$@"); echo "$(date +%F_%T) $label $jid" | tee -a "$MAP"; }
+    run_of() { readlink -f "$(ls -d $1 | tail -1)"; }
+    E=--export=ALL
+    if [ "$PHASE" = tune ]; then
+      sub tune_kolm    $E,DATASET=kolmogorov2d,MODELS="latent_fm sit s3gm mlp_rbf",SIT_NFES="8 16 32" tune_2d
+      sub tune_cyl     $E,DATASET=cylinder2d,MODELS="dmfgen sit mlp_rbf",SIT_NFES="8 16 32" tune_2d
+      sub tune_cyl_up  $E,DATASET=cylinder2d,MODELS=dmfgen,RUN_DIR_DMFGEN=$(run_of "$R/cylinder2d/pointcloud_ffm/bench_cyl_upstream_DemoN112_*") tune_2d
+      sub tune_surf    $E,DATASET=cylinder2d_surface,MODELS="dmfgen sit",SIT_NFES="8 16 32" tune_2d
+      sub tune_s3gm_sampler $E tune_s3gm_kolm_sampler
+      exit 0
+    fi
+    [ "$PHASE" = test ] || { echo "PHASE must be tune or test"; exit 2; }
+    KOLM="$E,DATASET=kolmogorov2d,NFE_SIT=32,SIT_RAW=1,NFE_S3GM=1000,RUN_DIR_MLP_RBF=$(run_of "$R/kolmogorov2d/baseline_mlp_rbf/Baseline_mlp_rbf_Stage1_DemoN564_*")"
+    CYL="$E,DATASET=cylinder2d,NFE_SIT=8,CKPT_DMFGEN=last,NFE_DMFGEN=8,RUN_DIR_MLP_RBF=$(run_of "$R/cylinder2d/baseline_mlp_rbf/Baseline_mlp_rbf_Stage1_DemoN572_*")"
+    SURF="$E,DATASET=cylinder2d_surface,NFE_SIT=8,SIT_RAW=1,CKPT_DMFGEN=last,NFE_DMFGEN=8"
+    # headline rows
+    sub kolm_test      -t 06:00:00 $KOLM,MODELS="latent_fm sit senseiver mlp_rbf geofno s3gm" eval_kolm_fleet
+    sub cyl_test       -t 04:00:00 $CYL,MODELS="dmfgen senseiver mlp_rbf geofno sit" eval_kolm_fleet
+    sub surf_test      -t 04:00:00 $SURF,MODELS="dmfgen senseiver mlp_rbf geofno sit" eval_kolm_fleet
+    sub cyl_dmfgen_up  -t 02:00:00 $E,DATASET=cylinder2d,MODELS=dmfgen,NFE_DMFGEN=4,RUN_DIR_DMFGEN=$(run_of "$R/cylinder2d/pointcloud_ffm/bench_cyl_upstream_DemoN112_*") eval_kolm_fleet
+    sub kolm_cq        -t 05:00:00 $E eval_kolm_dmfgen_cq
+    # seed replicates
+    for S in 7 1337; do
+      sub kolm_seed$S  -t 06:00:00 $E,DATASET=kolmogorov2d_seed$S,NFE_S3GM=1000,MODELS="latent_fm senseiver mlp_rbf geofno s3gm" eval_kolm_fleet
+      sub cyl_seed$S   -t 02:00:00 $E,DATASET=cylinder2d_seed$S,MODELS="senseiver mlp_rbf geofno" eval_kolm_fleet
+    done
+    # Kolmogorov density sweep (S3GM diverges at 65 and 164 sensors, so only 1965 and 6554) and operators
+    sub kolm_sweep     -t 06:00:00 $KOLM,NOBS_OVERRIDE="65 164 1965 6554",MODELS="latent_fm sit senseiver mlp_rbf geofno" eval_kolm_fleet
+    sub kolm_sweep_s3gm -t 06:00:00 $KOLM,NOBS_OVERRIDE="1965 6554",MODELS=s3gm eval_kolm_fleet
+    for OP in "--sensor-noise 0.1" "--sensor-noise 0.3" "--sensor-occlusion 0.25"; do
+      sub "kolm_op${OP// /}" -t 06:00:00 $KOLM,OPERATOR="$OP",MODELS="latent_fm sit senseiver mlp_rbf geofno s3gm" eval_kolm_fleet
+    done
+    sub kolm_band      -t 04:00:00 $E eval_kolm_band
+    sub crps_select    -t 04:00:00 $E eval_crps_select
+tune_2d:
+  purpose: TUNE-half selection sweeps for one 2D dataset (env DATASET, MODELS) - checkpoint x NFE, raw vs EMA weights,
+    S3GM steps and alpha_case, MLP-RBF rbf_sigma runs; then eval.tune_select.
+  sbatch:
+    time: 04:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # TUNE-half selection sweeps: every sampler / weight choice is made here, on the
+    # odd held-out frames, before anything is scored on TEST (eval_kolm_fleet).
+    #   DATASET=kolmogorov2d MODELS="latent_fm sit s3gm mlp_rbf" python -m launch submit tune_2d
+    set -uo pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    DATASET=${DATASET:-kolmogorov2d}
+    STM=$FRB_ROOT/outputs/runs/$DATASET
+    case ${DATASET%%_seed*} in
+      kolmogorov2d) EXPECT=320; NOBS=655; COND="0";   BLOCKS=1; PREFIX=kolm_tune
+                    MODELS=${MODELS:-"latent_fm sit s3gm mlp_rbf"} ;;
+      cylinder2d)   EXPECT=300; NOBS=238; COND="0 1"; BLOCKS=2; PREFIX=cyl_tune
+                    MODELS=${MODELS:-"dmfgen sit mlp_rbf"} ;;
+      cylinder2d_surface)   # taps on the wall ring; selection at the reported 128-tap count
+                    EXPECT=300; NOBS=128; COND="0 1 2"; BLOCKS=2; PREFIX=cylsurf_tune; CONDSRC=surface
+                    MODELS=${MODELS:-"dmfgen sit"} ;;
+      *) echo "[tune_2d] unknown DATASET=$DATASET"; exit 1 ;;
+    esac
+    COMMON="--split tune --expect-val-len $EXPECT --n-frames 50 --stratify-blocks $BLOCKS --cond-fields $COND --n-obs-list $NOBS --seed 0 --op-seed 1000 --no-figs ${CONDSRC:+--cond-source $CONDSRC}"
+    # RUN_DIR_<MODEL> overrides the run resolved below (e.g. the DMF-Gen upstream-recipe variant).
+    latest() { local ovr; ovr=$(eval echo "\${RUN_DIR_$(echo "$2" | tr '[:lower:]' '[:upper:]')-}"); [ -n "$ovr" ] && { readlink -f "$ovr"; return; }; readlink -f "$(ls -d $1 2>/dev/null | tail -1)" 2>/dev/null; }
+    FAIL=0
+    # CKPTS (default "best last"): the checkpoint is also a tuning-half choice for the
+    # generative rows, whose validation loss is a flow-matching / score objective and
+    # not the reconstruction metric; the deterministic rows select on their own loss.
+    CKPTS=${CKPTS:-"best last"}
+    # --resume: a timed-out sweep continues from its per-snapshot records, which are
+    # keyed by split / NFE / weights and checked on reload.
+    run() { echo "=== $*"; python -m eval.fleet_2d "$@" $COMMON --resume || FAIL=1; }
+    for M in $MODELS; do
+      case $M in
+        dmfgen)
+          R=$(latest "$STM/pointcloud_ffm_v1_b128/bench_*_v1_b128_DemoN*" dmfgen); [ -d "$R" ] || { echo "[tune_2d] no dmfgen run"; FAIL=1; continue; }
+          for CK in $CKPTS; do for NFE in 2 4 8 16; do run --model dmfgen --run-dir "$R" --ckpt $CK --K 8 --nfe $NFE --out-prefix ${PREFIX}_$CK; done; done ;;
+        latent_fm)
+          R=$(latest "$STM/baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN*" latent_fm); [ -d "$R" ] || { echo "[tune_2d] no latent_fm run"; FAIL=1; continue; }
+          for CK in $CKPTS; do for NFE in 2 4 8 16; do run --model latent_fm --run-dir "$R" --ckpt $CK --K 8 --nfe $NFE --out-prefix ${PREFIX}_$CK; done; done ;;
+        sit)
+          R=$(latest "$STM/baseline_sit_point/Baseline_sit_Stage1_DemoN*" sit); [ -d "$R" ] || { echo "[tune_2d] no sit run"; FAIL=1; continue; }
+          # SIT_NFES narrows the NFE sweep (e.g. SIT_NFES=16 to rescore the weights at a chosen NFE)
+          for CK in $CKPTS; do for NFE in ${SIT_NFES:-8 16 32}; do
+            run --model sit --run-dir "$R" --ckpt $CK --K 8 --nfe $NFE --out-prefix ${PREFIX}_$CK
+            run --model sit --run-dir "$R" --ckpt $CK --K 8 --nfe $NFE --raw-weights --out-prefix ${PREFIX}_${CK}_raw
+          done; done ;;
+        s3gm)
+          R=$(latest "$STM/baseline_s3gm/Baseline_s3gm_Stage1_DemoN*" s3gm); [ -d "$R" ] || { echo "[tune_2d] no s3gm run"; FAIL=1; continue; }
+          for CK in $CKPTS; do for N in 200 500 1000; do run --model s3gm --run-dir "$R" --ckpt $CK --K 8 --nfe $N --out-prefix ${PREFIX}_$CK; done; done
+          # upstream sampler: guidance alpha_case at N=1000 (largest non-divergent, one notch below a marginal edge)
+          [ "$PREFIX" = kolm_tune ] && for A in 0.25 0.3 0.35 0.4; do
+            run --model s3gm --run-dir "$R" --ckpt best --K 8 --nfe 1000 --s3gm-sampler upstream --s3gm-alpha-case $A --out-prefix ${PREFIX}_best_upstream_a$A; done ;;
+        mlp_rbf)
+          for R in $STM/baseline_mlp_rbf/Baseline_mlp_rbf_Stage1_DemoN*; do
+            [ -f "$R/best.pt" ] || continue
+            run --model mlp_rbf --run-dir "$R" --ckpt best --K 1 --out-prefix ${PREFIX}_$(basename "$R" | grep -o "DemoN[0-9]*")
+          done ;;
+        *) echo "[tune_2d] no sweep defined for $M"; FAIL=1 ;;
+      esac
+    done
+    python -m eval.tune_select "$DATASET" || true
+    exit $FAIL
+eval_kolm_fleet:
+  purpose: TEST rows of one 2D dataset (env DATASET, MODELS; settings via NFE_<M>, CKPT_<M>, SIT_RAW, RUN_DIR_<M>);
+    NOBS_OVERRIDE for the density sweep, OPERATOR for noise / occlusion.
+  sbatch:
+    time: 02:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Matched-protocol 2D fleet eval (Kolmogorov / cylinder). All sampling goes
+    # through -m eval.fleet_2d (canonical helpers.build_sparse_condition
+    # sensor draw under torch.manual_seed(seed*777+snap); fixed evenly-spaced val
+    # frames; K=8 generative, det-tiled deterministic rows; see its docstring).
+    #
+    # GENERIC LAUNCHER:
+    #   DATASET  kolmogorov2d (default) | cylinder2d
+    #   MODELS   space-separated legs, e.g.
+    #     MODELS="mlp_rbf s3gm" python -m launch submit eval_kolm_fleet
+    #     DATASET=cylinder2d MODELS="senseiver mlp_rbf geofno sit dmfgen" \
+    #         python -m launch submit eval_kolm_fleet
+    #   RUN_DIR_<MODEL> overrides the per-model run-dir glob.
+    # Wall default is 2h (backfill); pass sbatch --time for more. Every leg runs
+    # with --resume, so a timed-out job can simply be resubmitted and continues
+    # from the crps_snapN.json files already written.
+    #
+    # NOTE: deliberately no trailing `echo "exit status: $?"` -- that pattern
+    # forces exit 0 and makes a crashed job report COMPLETED.
+
+    set -uo pipefail
+
+    # Split env MUST match training (trajectory-holdout val block, no gap).
+    export JHU_SPLIT_MODE=block
+    export JHU_SPLIT_GAP=0
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
+    WT=$FRB_ROOT
+
+    DATASET=${DATASET:-kolmogorov2d}
+    STM=$WT/outputs/runs/$DATASET
+    # Seed replicates (kolmogorov2d_seed7, cylinder2d_seed1337, ...) share the
+    # base dataset's protocol constants; only the run root and prefix differ.
+    BASE=${DATASET%%_seed*}
+    SEEDTAG=${DATASET#"$BASE"}
+
+    case $BASE in
+      kolmogorov2d)
+        EXPECT=320; NOBS=655; COND="0"; BLOCKS=1; PREFIX=kolm_fleet$SEEDTAG; CONDSRC=points
+        MODELS=${MODELS:-"latent_fm sit senseiver mlp_rbf geofno s3gm"} ;;
+      cylinder2d)
+        # 600-frame val block = held-out Re {80, 250}, 300 frames each ->
+        # frames stratified across the two Re sub-blocks. cond_fields [0,1]
+        # (Ux, Uy observed; p unobserved = identifiability probe).
+        EXPECT=300; NOBS=238; COND="0 1"; BLOCKS=2; PREFIX=cyl_fleet$SEEDTAG; CONDSRC=points
+        MODELS=${MODELS:-"dmfgen senseiver mlp_rbf geofno sit"} ;;
+      cylinder2d_surface)
+        # Surface-to-field task: sensors ONLY on the wall-adjacent ring
+        # (mesh: 360 cells; grid: their unique nearest fluid cells), all three
+        # fields observed at the taps, tap budget swept 32/64/128/360 per field
+        # (capped at the pool). Runs live under outputs/runs/cylinder2d_surface.
+        EXPECT=300; NOBS="32 64 128 360"; COND="0 1 2"; BLOCKS=2; PREFIX=cyl_surface; CONDSRC=surface
+        MODELS=${MODELS:-"dmfgen senseiver mlp_rbf geofno sit"} ;;
+      *) echo "[launcher] unknown DATASET=$DATASET"; exit 1 ;;
+    esac
+
+    # NOBS_OVERRIDE lets a caller evaluate a subset of the density sweep. Used for
+    # the surface task's grid-locked models: their sensor pool is 62 cells, so any
+    # request above 62 draws the identical pool and 128/360 reproduce 64 bit for
+    # bit (verified for geofno/sit/latent_fm). Re-running them is pure cost.
+    # OPERATOR passes measurement-operator flags straight to the evaluator, e.g.
+    #   OPERATOR="--sensor-noise 0.1"      OPERATOR="--sensor-occlusion 0.25"
+    # The evaluator puts the operator into the cache key, the output filename and
+    # the protocol stamp itself, so nothing here needs to rename anything -- which
+    # is the point of having fixed it there rather than in each launcher.
+    OPERATOR="${OPERATOR:-}"
+    if [ -n "$OPERATOR" ]; then
+      echo "[launcher] OPERATOR=$OPERATOR (evaluator stamps and names the outputs)"
+    fi
+
+    if [ -n "${NOBS_OVERRIDE:-}" ]; then
+      # A density override must NOT write to the canonical output name: the
+      # canonical JSON is the fleet's headline row at the fleet's density, and an
+      # override run at a different density silently replaced it once. Redirect the
+      # prefix so override runs land beside the canonical row, never on top of it.
+      # The density goes in the NAME, not just a marker. A bare "_ovr" prefix is
+      # still one filename for every density, so consecutive override runs
+      # overwrite each other -- which is the same defect one level down from the
+      # canonical row it was added to protect. Encode the actual sensor count.
+      NOBS=$NOBS_OVERRIDE
+      PREFIX="${PREFIX}_ovr_n$(echo "$NOBS_OVERRIDE" | tr ' ' 'x')"
+      echo "[launcher] NOBS_OVERRIDE=$NOBS_OVERRIDE -> writing with prefix '$PREFIX' (canonical row untouched)"
+    fi
+
+    resolve_run_dir() {
+      # $1 = model name. RUN_DIR_<MODEL> env wins; else latest matching glob.
+      local m=$1 ovr pat
+      ovr=$(eval echo "\${RUN_DIR_$(echo "$m" | tr '[:lower:]' '[:upper:]')-}")
+      if [ -n "$ovr" ]; then readlink -f "$ovr"; return; fi
+      case $m in
+        dmfgen)     pat="$STM/pointcloud_ffm_v1_b128/bench_*_v1_b128_DemoN*" ;;
+        latent_fm)  pat="$STM/baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN*" ;;
+        sit)        # the point-tokenized SiT (the 3D row's configuration, trained
+                    # under baseline_sit_point) replaces the patch-tokenized run
+                    # on every 2D regime (2026-09-28; fleet_select.FAMILY_PREFERENCE)
+                    pat="$STM/baseline_sit_point/Baseline_sit_Stage1_DemoN*"
+                    ls -d $pat >/dev/null 2>&1 || pat="$STM/baseline_sit/Baseline_sit_Stage1_DemoN*" ;;
+        senseiver)  pat="$STM/baseline_det/Baseline_senseiver_Stage1_DemoN*" ;;
+        mlp_rbf|mlprbf) pat="$STM/baseline_mlp_rbf/Baseline_mlp_rbf_Stage1_DemoN*" ;;
+        geofno)     # the mesh-native Geo-FNO (deform variant, trained under
+                    # baseline_geofno_mesh) replaces the grid FNO on the cylinder
+                    # regimes (2026-10-02; fleet_select.FAMILY_PREFERENCE)
+                    pat="$STM/baseline_geofno_mesh/Baseline_geofno_Stage1_DemoN*"
+                    ls -d $pat >/dev/null 2>&1 || pat="$STM/baseline_geofno/Baseline_geofno_Stage1_DemoN*" ;;
+        s3gm)       pat="$STM/baseline_s3gm/Baseline_s3gm_Stage1_DemoN*" ;;
+        *)          echo ""; return ;;
+      esac
+      readlink -f "$(ls -d $pat 2>/dev/null | tail -1)" 2>/dev/null || echo ""
+    }
+
+    model_flags() {
+      # Extra fleet_2d flags per model (beyond the shared protocol). Sampler settings
+      # are the TUNE-half choices (tune_2d / eval.tune_select), passed as
+      # NFE_DMFGEN, NFE_LFM, NFE_SIT, NFE_S3GM (default: 4 / 4 / config sampling_N)
+      # and SIT_RAW=1 for raw instead of EMA weights. RUN_DIR_MLP_RBF names the
+      # rbf_sigma run chosen on TUNE (three runs share baseline_mlp_rbf).
+      case $1 in
+        dmfgen)
+          if [ "$BASE" = kolmogorov2d ] && [ -z "$SEEDTAG" ]; then
+            echo "--nfe ${NFE_DMFGEN:-4} --n-obs-list 65 164 655 1965 6554"   # sensor sweep (canonical seed only)
+          else
+            echo "--nfe ${NFE_DMFGEN:-4} --n-obs-list $NOBS"
+          fi ;;
+        latent_fm) echo "--nfe ${NFE_LFM:-4} --n-obs-list $NOBS" ;;
+        sit)       echo "${NFE_SIT:+--nfe $NFE_SIT} ${SIT_RAW:+--raw-weights} --n-obs-list $NOBS" ;;
+        s3gm)      # Kolmogorov: upstream S3GM sampler, alpha_case chosen on TUNE (tune_2d)
+                   if [ "$BASE" = kolmogorov2d ]; then
+                     echo "${NFE_S3GM:+--nfe $NFE_S3GM} --s3gm-sampler upstream --s3gm-alpha-case ${S3GM_ALPHA_CASE:-0.3} --n-obs-list $NOBS"
+                   else
+                     echo "${NFE_S3GM:+--nfe $NFE_S3GM} --n-obs-list $NOBS"
+                   fi ;;
+        *)         echo "--n-obs-list $NOBS" ;;  # senseiver/mlp_rbf/geofno: det (surface: NOBS is the tap sweep)
+      esac
+    }
+
+    echo "=== node $(hostname) job ${SLURM_JOB_ID} DATASET=$DATASET MODELS='$MODELS' ==="
+    nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader
+
+    FAIL=0
+    for M in $MODELS; do
+      RUN=$(resolve_run_dir "$M")
+      if [ -z "$RUN" ] || [ ! -d "$RUN" ]; then
+        echo "[launcher] $M: no run dir found (set RUN_DIR_$(echo "$M" | tr '[:lower:]' '[:upper:]') or train it first); SKIPPING as FAILURE"
+        FAIL=1
+        continue
+      fi
+      if [ ! -f "$RUN/best.pt" ]; then
+        echo "[launcher] $M: $RUN has no best.pt (training incomplete?); SKIPPING as FAILURE"
+        FAIL=1
+        continue
+      fi
+      if [ -n "${REQUIRE_EPOCH:-}" ]; then
+        # Segmented trainings chain their eval with afterany, and a partial run has
+        # a best.pt too: refuse to score a run that has not reached its epoch budget.
+        EP=$(python -c "from methods.common.config import safe_torch_load; print(int(safe_torch_load('$RUN/last.pt').get('epoch', -1)))" 2>/dev/null || echo -1)
+        if [ "$EP" -lt "$REQUIRE_EPOCH" ]; then
+          echo "[launcher] $M: $RUN is at epoch $EP < $REQUIRE_EPOCH (training incomplete); SKIPPING as FAILURE"
+          FAIL=1
+          continue
+        fi
+      fi
+      CK=$(eval echo "\${CKPT_$(echo "$M" | tr '[:lower:]' '[:upper:]')-best}")   # tuning-half choice: best | last
+      echo "=== $M -> $RUN (ckpt $CK) ==="
+      # shellcheck disable=SC2046,SC2086
+      if ! python -m eval.fleet_2d --model "$M" --run-dir "$RUN" \
+            --ckpt $CK --K 8 $(model_flags "$M") \
+            --cond-fields $COND --expect-val-len $EXPECT --cond-source $CONDSRC \
+            --stratify-blocks $BLOCKS --out-prefix $PREFIX --resume \
+            --n-frames 50 --seed 0 --op-seed 1000 --fig-every 10 $OPERATOR; then
+        echo "[launcher] $M EVAL FAILED"
+        FAIL=1
+      fi
+      echo "--- $M JSONs ---"
+      ls -la "$RUN"/Evaluation/${PREFIX}*.json "$RUN"/Evaluation/${PREFIX}*_n*.json \
+             "$RUN"/Evaluation/sensor_sweep_*.json 2>/dev/null || true
+      echo "$M crps files: $(ls "$RUN"/Evaluation/crps_snap*.json 2>/dev/null | wc -l)"
+    done
+
+    exit $FAIL
+eval_kolm_dmfgen_cq:
+  purpose: Kolmogorov DMF-Gen (upstream GL_rbf_CQ run) - TUNE sweep over milestone checkpoints x NFE, then the TEST
+    row, band pass, density sweep, operators, gallery dump and the CRPS-selected setting.
+  sbatch:
+    time: 05:00:00
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    # The rel-L2 choice on TUNE carries to TEST. best.pt is not a candidate: the upstream
+    # trainer selected it on frames that include TEST.
+    set -u
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0
+    FAM=outputs/runs/kolmogorov2d/upstream_gl_rbf_cq_range
+    RD=$(ls -d $FAM/*/ | tail -1); RD=${RD%/}
+    EV="--model dmfgen_cq --run-dir $RD --K 8 --seed 0 --op-seed 1000 --expect-val-len 320"
+    RC=0
+    for CK in epoch_500 epoch_1000 epoch_1500 epoch_2000 epoch_3000 epoch_4000; do for N in 2 4 8 16; do
+      python -u -m eval.fleet_2d $EV --split tune --ckpt $CK --nfe $N --n-obs-list 655 --no-figs \
+        --resume --out-prefix kolm_tune_$CK || RC=1
+    done; done
+    pick() { python - "$FAM" "$1" <<'PY'
+    import glob, json, sys
+    rows = [json.load(open(p)) for p in glob.glob(f"{sys.argv[1]}/*/Evaluation/kolm_tune_*.json")]
+    d = min(rows, key=lambda d: d["summary"]["aggregate"][sys.argv[2]])
+    print(d["ckpt"], d["nfe"])
+    PY
+    }
+    read CK N < <(pick rel_l2_mean)
+    echo "##### TUNE choice: ckpt $CK NFE $N"
+    T="$EV --split test --ckpt $CK --nfe $N --resume"
+    python -u -m eval.fleet_2d $T --n-obs-list 655 --out-prefix kolm_fleet || RC=1
+    python -u -m eval.fleet_2d $T --n-obs-list 655 --band-metrics --no-figs --out-prefix kolm_band || RC=1
+    python -u -m eval.fleet_2d $T --n-obs-list 65 164 1965 6554 --no-figs --out-prefix kolm_fleet_ovr_n65x164x1965x6554 || RC=1
+    for OP in "--sensor-noise 0.1" "--sensor-noise 0.3" "--sensor-occlusion 0.25"; do
+      python -u -m eval.fleet_2d $T $OP --n-obs-list 655 --no-figs --out-prefix kolm_fleet || RC=1
+    done
+    mkdir -p outputs/pof/field_dumps
+    python -u -m eval.fleet_2d $T --n-obs-list 655 --cond-fields 0 --dump-frame 128 \
+      --dump-npz outputs/pof/field_dumps/kolm_dmfgen_cq_range.npz || RC=1
+    # CRPS-selected TUNE setting (SM table) in a shadow run dir, so its TEST records and payload
+    # stay out of the canonical run's Evaluation/.
+    read CK N < <(pick crps)
+    echo "##### TUNE CRPS choice: ckpt $CK NFE $N"
+    SRC=$(readlink -f $RD); SH=${SRC/kolm_shu_gl_rbf_cq_w296_range/kolm_shu_gl_rbf_cq_w296_range_crpssel}
+    mkdir -p $SH/checkpoints; cp $SRC/resolved_config.yaml $SH/; ln -sf $SRC/checkpoints/$CK.pt $SH/checkpoints/
+    python -u -m eval.fleet_2d --model dmfgen_cq --run-dir $SH --K 8 --seed 0 --op-seed 1000 --expect-val-len 320 \
+      --split test --ckpt $CK --nfe $N --n-obs-list 655 --no-figs --resume --out-prefix crpssel || RC=1
+    echo "exit $RC"; exit $RC
+eval_kolm_band:
+  purpose: Kolmogorov TEST half with band metrics (k 32-128 and 1-8 energy ratios, band correlations) for the learned
+    rows at their reported settings and for IDW / gappy POD.
+  sbatch:
+    time: 02:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # Settings are the canonical TEST rows (fleet_select): latent FM N4, SiT-point
+    # best/N32 per-step sampler (raw weights; SIT_W="" for EMA), S3GM N1000.
+    # Smoke: NFRAMES=2 K=2 TAG=smoke_.
+    set -uo pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    STM=$FRB_ROOT/outputs/runs/kolmogorov2d
+    NF=${NFRAMES:-50}; K=${K:-8}; TAG=${TAG:-}
+    latest() { readlink -f "$(ls -d $STM/$1 | tail -1)"; }
+    FAIL=0
+    for M in ${MODELS:-senseiver geofno mlp_rbf latent_fm sit s3gm classical}; do
+      case $M in
+        senseiver) A="--run-dir $(latest 'baseline_det/Baseline_senseiver_Stage1_DemoN61_*') --ckpt best" ;;
+        geofno)    A="--run-dir $(latest 'baseline_geofno/Baseline_geofno_Stage1_DemoN65_*') --ckpt best" ;;
+        mlp_rbf)   A="--run-dir $(latest 'baseline_mlp_rbf/Baseline_mlp_rbf_Stage1_DemoN564_*') --ckpt best" ;;
+        latent_fm) A="--run-dir $(latest 'baseline_latent_fm/Baseline_latent_fm_Stage2_DemoN60_*') --ckpt best --nfe 4" ;;
+        sit)       A="--run-dir $(latest 'baseline_sit_point/Baseline_sit_Stage1_DemoN67_*') --ckpt best --nfe 32 ${SIT_W---raw-weights}" ;;
+        s3gm)      A="--run-dir $(latest 'baseline_s3gm/Baseline_s3gm_Stage1_DemoN63_*') --ckpt best --nfe 1000 --s3gm-sampler upstream --s3gm-alpha-case 0.3" ;;
+        classical)
+          # IDW k=8 and gappy POD r160 as in the Kolmogorov gallery (dump_classical_gallery), on the
+          # same TEST frames and CUDA sensor draws as fleet_2d.
+          python - "$NF" "$STM/baseline_classical/${TAG}kolm_band_classical.json" <<'PY' || FAIL=1
+    import json, sys
+    import numpy as np, torch
+    import methods.classical.anchors_2d as C
+    from methods.dmfgen.spectral_utils import band_metrics
+    from eval.fleet_2d import KOLM_BANDS
+    from paths import DATA_DIR
+    from protocol import frame_list, held_out_subset
+    h5 = f"{DATA_DIR}/kolmogorov2d/Kolmogorov2D_shu_stride4.h5"
+    craw, T, nc = C.read_layout(h5)
+    N, side = craw.shape[0], int(round(craw.shape[0] ** 0.5))
+    train_idx = np.arange(2560)
+    test_idx = held_out_subset(np.arange(2560, T), "test")
+    mean, std = C.compute_train_stats(h5, train_idx, nc)
+    box, boxsize = C.build_coords_box(craw, periodic=False)
+    coords_t = torch.from_numpy(box.astype(np.float32))
+    Xtr = C.load_split(h5, train_idx, N, nc, mean, std).reshape(len(train_idx), -1)
+    mu = Xtr.mean(axis=0)
+    Xtr -= mu
+    pod = C.GappyPOD(Xtr, mu, rank=160)
+    grid = lambda a: a.T.reshape(1, nc, side, side)
+    per = []
+    for s in frame_list(len(test_idx), int(sys.argv[1]), 1):
+        Y = C.load_split(h5, test_idx[[s]], N, nc, mean, std)[0]
+        sens = C.draw_sensors(coords_t, torch.from_numpy(Y), snap=s, n_obs=655, seed=0,
+                              device="cuda:0", cond_fields=[0])
+        cols, vals = C.obs_columns(sens, nc)
+        pred = {"idw": C.kd_predict(box, sens, nc, "idw", 8, boxsize),
+                "gappy_pod_r160": pod.reconstruct(cols, vals).reshape(N, nc)}
+        per.append({"snapshot": int(s), "idx_sum": int(sens[0][0].sum()),
+                    **{k: band_metrics(grid(p), grid(Y)[0], KOLM_BANDS, window=False, k_power=-2)
+                       for k, p in pred.items()}})
+        print(json.dumps(per[-1]), flush=True)
+    summary = {k: {b: {m: float(np.mean([r[k][b][m] for r in per])) for m in per[0][k][b]}
+                   for b in KOLM_BANDS} for k in ("idw", "gappy_pod_r160")}
+    json.dump({"split": "test", "n_obs": 655, "bands": KOLM_BANDS, "band_summary": summary,
+               "note": "spectral_utils.band_metrics, no window, k_power=-2; deterministic, K=1",
+               "snapshots": per}, open(sys.argv[2], "w"), indent=1)
+    print(json.dumps(summary, indent=1))
+    PY
+          continue ;;
+        *) echo "[eval_kolm_band] unknown model $M"; FAIL=1; continue ;;
+      esac
+      echo "=== $M"
+      python -m eval.fleet_2d --model $M $A --band-metrics --split test --K $K --n-frames $NF \
+        --n-obs-list 655 --cond-fields 0 --expect-val-len 320 --seed 0 --op-seed 1000 \
+        --out-prefix ${TAG}kolm_band --no-figs --resume || FAIL=1
+    done
+    exit $FAIL
+eval_kolm_probes:
+  purpose: Kolmogorov seen-trajectory probe (SiT-point, Senseiver, FNO, latent FM) and 25x26 sensor-lattice probe
+    (DMF-Gen), each against IDW, with the canonical TEST settings (eval.litprotocol_2d).
+  sbatch:
+    time: 01:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    set -uo pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    FAIL=0
+    python -m eval.litprotocol_2d --arms seen --models sit senseiver geofno latent_fm || FAIL=1
+    python -m eval.litprotocol_2d --arms lattice --models dmfgen_cq || FAIL=1
+    exit $FAIL
+eval_crps_select:
+  purpose: TEST scores of the CRPS-selected TUNE settings (SM table) in shadow run directories under outputs/runs/crps_select,
+    so canonical records stay untouched.
+  sbatch:
+    time: 02:00:00
+    mem: 96G
+    cpus: 8
+    gpus: 1
+  body: |
+    # fleet_2d writes TEST per-snapshot records under <run>/Evaluation by one name for every
+    # setting, so a second setting scored in the real run dir would replace the canonical ones.
+    set -uo pipefail
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    R=$FRB_ROOT/outputs/runs
+    shadow() {   # $1 dataset, $2 family, $3 run glob -> prints the shadow run dir
+      local src dst f
+      src=$(readlink -f "$(ls -d $R/$1/$2/$3 | tail -1)")
+      dst=$R/crps_select/$1/$2/$(basename "$src")
+      mkdir -p "$dst"
+      ln -sf "$src/best.pt" "$src/last.pt" "$dst/"
+      for f in args.json run_config.yaml run_metadata.json dataset_stats.pt; do
+        if [ -f "$src/$f" ]; then cp "$src/$f" "$dst/"; fi
+      done
+      echo "$dst"
+    }
+    KOLM="--expect-val-len 320 --cond-fields 0 --n-obs-list 655 --stratify-blocks 1"
+    CYL="--expect-val-len 300 --cond-fields 0 1 --n-obs-list 238 --stratify-blocks 2"
+    SURF="--expect-val-len 300 --cond-fields 0 1 2 --n-obs-list 128 --stratify-blocks 2 --cond-source surface"
+    FAIL=0
+    run() {      # $1 dataset, $2 family, $3 run glob, then fleet_2d flags
+      local rd; rd=$(shadow "$1" "$2" "$3"); shift 3
+      echo "=== $rd $*"
+      python -m eval.fleet_2d --run-dir "$rd" "$@" --split test --K 8 --n-frames 50 --seed 0 \
+        --op-seed 1000 --no-figs --resume --out-prefix crpssel || FAIL=1
+    }
+    # SiT-point (per-step sampler, N and weights tuned jointly): on Kolmogorov CRPS selects the
+    # reported setting; on the cylinder raw weights at N=8 (TUNE CRPS 0.032886 vs 0.033212 for the
+    # reported EMA), on the surface EMA at N=8 (0.039655 vs 0.039772 for the reported raw).
+    LEGS=${LEGS:-"kolm_latent_fm cyl_dmfgen cyl_sit surf_dmfgen surf_sit"}
+    for L in $LEGS; do
+      case $L in
+        kolm_latent_fm) run kolmogorov2d baseline_latent_fm "Baseline_latent_fm_Stage2_DemoN*" --model latent_fm --ckpt best --nfe 16 $KOLM ;;
+        cyl_dmfgen)     run cylinder2d pointcloud_ffm_v1_b128 "bench_cyl_v1_b128_DemoN*" --model dmfgen --ckpt last --nfe 16 $CYL ;;
+        cyl_sit)        run cylinder2d baseline_sit_point "Baseline_sit_Stage1_DemoN*" --model sit --ckpt best --nfe 8 --raw-weights $CYL ;;
+        surf_dmfgen)    run cylinder2d_surface pointcloud_ffm_v1_b128 "bench_cyl_surface_v1_b128_DemoN*" --model dmfgen --ckpt last --nfe 2 $SURF ;;
+        surf_sit)       run cylinder2d_surface baseline_sit_point "Baseline_sit_Stage1_DemoN*" --model sit --ckpt best --nfe 8 $SURF ;;
+        *) echo "[eval_crps_select] unknown leg $L"; FAIL=1 ;;
+      esac
+    done
+    exit $FAIL
+tune_s3gm_kolm_sampler:
+  purpose: Kolmogorov S3GM sampler variants on every 5th TUNE frame (upstream sampler over alpha_case and N, denoised
+    predictor-corrector); summarised by analysis.diagnostics.s3gm_sampler_tune.
+  sbatch:
+    time: 04:00:00
+    mem: 64G
+    cpus: 8
+    gpus: 1
+  body: |
+    # ARMS: space-separated sampler:nfe:alpha_case items (alpha_case is used by `upstream` only).
+    set -u
+    export JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TQDM_DISABLE=1
+    ARMS=${ARMS:-"pc_dps_denoised:1000:0.5 upstream:1000:0.05 upstream:1000:0.1 upstream:1000:0.2 upstream:1000:0.25 upstream:1000:0.5 upstream:200:0.01 upstream:200:0.02 upstream:200:0.05 upstream:200:0.1 upstream:200:0.25 upstream:200:0.5 upstream:200:1.0"}
+    RUN=$(readlink -f "$(ls -d outputs/runs/kolmogorov2d/baseline_s3gm/Baseline_s3gm_Stage1_DemoN63_* | tail -1)")
+    OUT=outputs/rescore_2d/s3gm_sampler_tune
+    RC=0
+    for ARM in $ARMS; do
+      IFS=: read -r SAMPLER NFE ALPHA <<< "$ARM"
+      echo "=== sampler=$SAMPLER nfe=$NFE alpha_case=$ALPHA"
+      python -u -m eval.fleet_2d --model s3gm --run-dir $RUN --ckpt best --K 8 --nfe $NFE \
+        --split tune --expect-val-len 320 --n-frames 50 --frame-stride 5 --stratify-blocks 1 \
+        --cond-fields 0 --n-obs-list 655 --seed 0 --op-seed 1000 --no-figs --band-metrics --resume \
+        --s3gm-sampler $SAMPLER --s3gm-alpha-case $ALPHA --out-dir $OUT \
+        --out-prefix kolm_tune_${SAMPLER}_a${ALPHA} || RC=1
+    done
+    python -I src/analysis/diagnostics/s3gm_sampler_tune.py || RC=1
+    exit $RC

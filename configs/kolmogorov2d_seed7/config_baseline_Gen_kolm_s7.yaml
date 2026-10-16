@@ -1,0 +1,153 @@
+# SEED REPLICATE (seed 7) of configs/kolmogorov2d/config_baseline_Gen_kolm.yaml -- identical otherwise.
+# =============================================================================
+# PoF-benchmark 2D Kolmogorov — latent flow matching (2-stage, spatial_dim 2
+# engages via absent num_z). Protocol identical to config_baseline_Det_kolm:
+# JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0, train_ratio 0.8, sensors 0.1-10%.
+# Budget: ~50k optimizer steps over BOTH stages (s1 25.6k + s2 25k); 6.78 M parameters
+# including the autoencoder (tools.count_params).
+# =============================================================================
+
+baseline_model: latent_fm
+training_stage: 1              # run stage 1 then stage 2 (LFM_STAGE pattern)
+
+shared:
+  demo_num: 160
+  seed: 7
+  device_ids: [0]
+  reload: true
+
+  paths:
+    data_path: "data/kolmogorov2d/Kolmogorov2D_shu_stride4.h5"
+    save_root: "outputs/runs/kolmogorov2d_seed7/baseline_latent_fm"
+    config_backup_root: "configs/kolmogorov2d_seed7/gen_baseline"
+
+  data:
+    dataset_name: "kolmogorov2d"
+    train_ratio: 0.8
+    time_stride: 1
+    num_workers: 4
+    num_x: 256
+    num_y: 256
+    field_names: ["vorticity"]
+
+  conditioning:
+    cond_fields: [0]
+    n_obs_min_list: [65]
+    n_obs_max_list: [6554]
+    vis_cond_fields: [0]
+    vis_n_obs_list: [655]
+
+  logging:
+    eval_every: 5
+    save_every: 500
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+s3gm_params:
+  training:
+    epochs: 650                 # bs 48 -> ~54 steps/ep -> ~35k steps; extend if underfit
+    batch_size: 48
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 200
+
+  architecture:
+    nf: 128
+    ch_mult: [1, 2, 4, 8]
+    num_res_blocks: 2
+    attn_resolutions: [8]
+    num_heads: 1
+    dropout: 0.1
+    use_checkpoint: false
+
+  diffusion:
+    sigma_min: 0.1
+    sigma_max: 7.0
+    num_scales: 1000
+    ema_rate: 0.999
+
+  sampling:
+    sampling_N: 200
+    snr: 0.128
+    n_corrector_steps: 5
+    alpha_obs: 1.0
+    benchmark_n_steps: [200]
+
+latent_fm_params:
+  stage1:                        # autoencoder 0.65 M; 80 epochs x 320 steps = 25.6k steps
+    architecture:
+      base_ch: 48
+      latent_ch: 48
+      n_levels: 3
+      num_res_blocks: 2
+    training:
+      epochs: 80
+      batch_size: 8
+      learning_rate: 1.0e-4
+      weight_decay: 1.0e-6
+      eval_every: 5
+      save_every: 40
+
+  stage2:                        # velocity UNet 6.13 M; 625 epochs x 40 steps = 25k steps
+    architecture:
+      base_ch: 60
+      ch_mult: [1, 2]
+      num_res_blocks: 3
+      num_heads: 8
+      ema_decay: 0.999
+      latent_scale_mode: per_channel   # the JHU fidelity repair (unit-std latents), disclosed
+    conditioning:
+      cond_mode: image_norm            # masked-mean conditioning, as the JHU row
+      pointnet_hidden_mult: 1.0
+    training:
+      epochs: 625
+      batch_size: 64
+      learning_rate: 1.0e-4
+      weight_decay: 0.0
+      eval_every: 5
+      save_every: 200
+    sampling:
+      ode_solver: euler
+      benchmark_n_steps: [2, 4, 8, 16]
+    stage1_checkpoint:
+
+sit_params:
+  training:
+    epochs: 650
+    batch_size: 32
+    learning_rate: 5.0e-5
+    weight_decay: 0.0001
+    eval_every: 5
+    save_every: 500
+    adam_eps: 1.0e-6
+    huber_beta: 0.1
+
+  architecture:
+    patch_size: 8               # 256/8 = 32x32 tokens (patch 4 would be 4096 tokens)
+    hidden_size: 256
+    depth: 8
+    num_heads: 4
+    mlp_ratio: 4.0
+    tokenizer: "patch"
+    coord_dim: 2
+    fourier_num_freqs: 64
+    fourier_scale: 10.0
+    ema_rate: 0.9999
+
+  transport:
+    path_type: "Linear"
+    prediction: "velocity"
+    loss_weight:
+
+  conditioning:
+    cond_mode: "interp"
+
+  sampling:
+    sampling_N: 50
+    ode_solver: "euler"
+    benchmark_n_steps: [4, 16, 32, 64]

@@ -1,0 +1,126 @@
+# =============================================================================
+# PoF-benchmark 2D cylinder SURFACE-TO-FIELD — Geo-FNO proper (deform variant: learned deformation
+# + Fourier layers evaluated at the mesh points) on the NATIVE MESH (23800
+# cells), no grid export. Protocol identical to config_baseline_Det_cyl:
+# JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0, train_ratio 0.6667 = frames [0,1200)
+# train Re{60,100,150,200} / [1200,1800) held-out Re{80,250}.
+# Sensors: 32-360 taps per field on the 360 wall-adjacent cells, all three
+# fields observed at the taps (config_baseline_Det_cyl_surface protocol).
+# Budget ~50k steps, as the grid row: bs 32 -> 38 steps/epoch -> 1300 epochs.
+# Runs land under baseline_geofno_mesh (fleet_select.FAMILY_PREFERENCE makes
+# them the reported Geo-FNO rows; the grid FNO stays under baseline_geofno).
+# =============================================================================
+
+baseline_model: "geofno"  # `mlp_rbf`, `senseiver`, or `geofno`
+training_stage: 1
+
+shared:
+  demo_num: 89
+  seed: 42
+  device_ids: [0]
+  reload: true
+
+  paths:
+    data_path: "data/cylinder2d/Cylinder2D_mesh.h5"
+    save_root: "outputs/runs/cylinder2d_surface/baseline_geofno_mesh"
+    config_backup_root: "configs/cylinder2d_surface/det_baseline"
+
+  data:
+    dataset_name: "cylinder2d"
+    train_ratio: 0.6667
+    time_stride: 1
+    num_workers: 4
+    num_x: 400               # unused by the deform variant (mesh is not
+    num_y: 200               # reshapeable); kept for the shared-config schema
+    field_names: ["Ux", "Uy", "p"]
+
+  conditioning:
+    cond_fields: [0, 1, 2]     # all fields observed AT THE TAPS only (surface-to-field)
+    sensor_pool: "surface"     # restrict sensors to the H5 surface_indices pool
+    n_obs_min_list: [32]       # taps per field U{32..360} (mesh pool 360)
+    n_obs_max_list: [360]
+    vis_cond_fields: [0, 1, 2]
+    vis_n_obs_list: [128]
+
+  logging:
+    eval_every: 5
+    save_every: 500
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+mlp_rbf_params:
+  training:
+    epochs: 5000
+    batch_size: 128
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+    n_query_points: 4096
+
+  architecture:
+    coord_dim: 3   # 3-wide coord convention (constant z=0.5)
+    hidden_dim: 256
+    cond_dim: 128
+    field_embed_dim: 128
+    rbf_sigma: 0.05
+    use_fourier_pe: true
+    fourier_pe_num_bands: 32
+    fourier_pe_max_freq: 64.0
+
+senseiver_params:
+  training:
+    epochs: 5000
+    batch_size: 128
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+    n_query_points: 4096
+
+  architecture:
+    coord_dim: 2
+    num_latents: 128
+    latent_dim: 128
+    num_encoder_layers: 3
+    num_self_attn_per_block: 3
+    num_cross_attn_heads: 8
+    num_self_attn_heads: 8
+    dec_num_cross_attn_heads: 8
+    field_embed_dim: 32
+    space_bands: 32
+    max_freq: 64.0
+    ff_mult: 4
+    dropout: 0.0
+
+geofno_params:
+  training:
+    epochs: 1300
+    batch_size: 32
+    optimizer: upstream        # reference Geo-FNO: Adam 1e-3 operator / 1e-4 deformation, wd 1e-4,
+    learning_rate: 1.0e-3      # StepLR halving every epochs/5, relative-L2 loss, no clipping
+    iphi_lr_ratio: 0.1
+    weight_decay: 1.0e-4
+    lr_step_epochs: 260
+    lr_step_gamma: 0.5
+    loss: rel_l2
+    grad_clip: null
+    eval_every: 5
+    save_every: 500
+
+  architecture:
+    geofno_variant: "deform"   # `fno` grid | `irregular` splat/gather | `deform` Geo-FNO on the mesh
+    fno_modes_x: 20            # 6.47 M by tools.count_params (was 32 x 16, width 64: 21.1 M)
+    fno_modes_y: 20
+    fno_hidden_channels: 40
+    fno_n_layers: 3            # latent grid layers between the point-in and point-out layers
+
+    latent_Nx: 80              # latent torus grid, 4x the kept modes
+    latent_Ny: 80
+    iphi_width: 32
+    iphi_center_xy: [0.0, 0.0] # cylinder centre (physical units)
+    domain_padding: 0.1        # mesh occupies [0.1, 0.9]^2 of the latent torus

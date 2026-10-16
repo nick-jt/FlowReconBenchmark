@@ -1,0 +1,24 @@
+[submodule "third_party/S3GM"]
+	path = third_party/S3GM
+	url = https://github.com/lzy12301/S3GM
+[submodule "third_party/SiT"]
+	path = third_party/SiT
+	url = https://github.com/willisma/SiT
+[submodule "third_party/CoNFiLD"]
+	path = third_party/CoNFiLD
+	url = https://github.com/jx-wang-s-group/CoNFiLD
+[submodule "third_party/Gen4Turbulence"]
+	path = third_party/Gen4Turbulence
+	url = https://github.com/vivekoommen/Gen4Turbulence
+[submodule "third_party/Senseiver"]
+	path = third_party/Senseiver
+	url = https://github.com/OrchardLANL/Senseiver
+[submodule "third_party/deepxde"]
+	path = third_party/deepxde
+	url = https://github.com/lululxvi/deepxde
+[submodule "third_party/deeponet"]
+	path = third_party/deeponet
+	url = https://github.com/lululxvi/deeponet
+[submodule "third_party/PhyCoFlow-MultiFieldReconstruction"]
+	path = third_party/PhyCoFlow-MultiFieldReconstruction
+	url = https://github.com/cosmos2w/PhyCoFlow-MultiFieldReconstruction

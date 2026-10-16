@@ -1,0 +1,15 @@
+# FlowReconBench runtime dependencies (validated with the versions in requirements-lock.txt,
+# Python 3.11, CUDA 13; recreate with `pip install -r requirements-lock.txt` for an exact match).
+torch>=2.7
+numpy
+scipy
+h5py
+pyyaml
+matplotlib
+tqdm
+einops
+timm                # SiT attention/MLP blocks
+pykeops             # DMF-Gen k-nearest-sensor retrieval (JIT-compiled at first use)
+neuraloperator==2.0.0   # Geo-FNO / FNO backbones (pinned: the FNO API changed across majors)
+pytest
+# givernylocal       # JHTDB download only (src/data_prep/jhtdb)

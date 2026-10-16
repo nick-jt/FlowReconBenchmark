@@ -1,0 +1,117 @@
+# =============================================================================
+# PoF-benchmark 2D cylinder (native mesh, 23800 cells, Re-parameterized wake)
+# Deterministic baselines. Re-holdout protocol: frames [0,1200) = train
+# Re{60,100,150,200}, [1200,1800) = held-out Re{80,250}; launchers must set
+# JHU_SPLIT_MODE=block JHU_SPLIT_GAP=0 and train_ratio 0.6667 to reproduce it.
+# Sensor budget mirrors the JHU fractional protocol: 0.1-2% of 23800 cells per
+# observed field. p is NEVER observed (cond_fields [0,1]) — identifiability probe.
+# Budget target ~50k optimizer steps (bs 128 -> ~10 steps/epoch -> 5000 epochs).
+# MLP-RBF has no upstream: AdamW + cosine schedule of the benchmark trainer. rbf_sigma is
+# chosen on TUNE from {0.02, 0.05, 0.1} (this file 0.05; *_sig002 / *_sig01 variants).
+# =============================================================================
+
+baseline_model: "mlp_rbf"  # `mlp_rbf`, `senseiver`, or `geofno`
+training_stage: 1
+
+shared:
+  demo_num: 672
+  seed: 42
+  device_ids: [0]
+  reload: true
+
+  paths:
+    data_path: "data/cylinder2d/Cylinder2D_mesh.h5"
+    save_root: "outputs/runs/cylinder2d/baseline_mlp_rbf"
+    config_backup_root: "configs/cylinder2d/det_baseline"
+
+  data:
+    dataset_name: "cylinder2d"
+    train_ratio: 0.6667
+    time_stride: 1
+    num_workers: 4
+    num_x: 400               # unused by the point-based adapters (mesh is not
+    num_y: 200               # reshapeable); kept for the shared-config schema
+    field_names: ["Ux", "Uy", "p"]
+
+  conditioning:
+    cond_fields: [0, 1]        # velocities observed; p never observed
+    n_obs_min_list: [24]       # 0.1% of 23800, broadcast to both fields
+    n_obs_max_list: [476]      # 2%
+    vis_cond_fields: [0, 1]
+    vis_n_obs_list: [238]
+
+  logging:
+    eval_every: 5
+    save_every: 500
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+mlp_rbf_params:
+  training:
+    epochs: 5000
+    batch_size: 128
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+    n_query_points: 4096
+
+  architecture:
+    coord_dim: 3   # 3-wide coord convention (constant z=0.5) — the mlp_rbf 3-wide lesson
+    hidden_dim: 940              # 6.55 M by tools.count_params (was 256: 0.59 M)
+    cond_dim: 128
+    field_embed_dim: 128
+    rbf_sigma: 0.1
+    use_fourier_pe: true
+    fourier_pe_num_bands: 32
+    fourier_pe_max_freq: 64.0
+
+senseiver_params:
+  training:
+    epochs: 5000
+    batch_size: 128
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+    n_query_points: 4096
+
+  architecture:
+    coord_dim: 2
+    num_latents: 128
+    latent_dim: 128
+    num_encoder_layers: 3
+    num_self_attn_per_block: 3
+    num_cross_attn_heads: 8
+    num_self_attn_heads: 8
+    dec_num_cross_attn_heads: 8
+    field_embed_dim: 32
+    space_bands: 32
+    max_freq: 64.0
+    ff_mult: 4
+    dropout: 0.0
+
+geofno_params:
+  training:
+    epochs: 1300
+    batch_size: 32
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    eval_every: 5
+    save_every: 500
+
+  architecture:
+    geofno_variant: "fno"
+    fno_modes_x: 32
+    fno_modes_y: 24
+    fno_hidden_channels: 64
+    fno_n_layers: 4
+
+    latent_Nx: 64
+    latent_Ny: 64
+    gno_radius: 0.1
+    gno_transform_type: "linear"

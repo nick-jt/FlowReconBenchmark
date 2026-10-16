@@ -1,0 +1,137 @@
+# CoNFiLD (du2024confild, Nat. Commun. 2024) on the JHU cross-cube protocol.
+# Upstream compared against: github.com/jx-wang-s-group/CoNFiLD @ 449835e
+# (2025-02-19; last CODE change 1ae4f81, 2024-11-08). The SIREN auto-decoder and
+# the latent-diffusion UNet are imported verbatim from that checkout.
+#
+# ARM: P - published prior, wall-clock matched (NOT parameter matched)
+# Identical to arm C in every respect EXCEPT the stage-2 denoiser, which is
+# upstream's published case-4 prior. Matching on total parameters charges
+# CoNFiLD's compression codec against the same budget as its generative model
+# and leaves 1.4M for the prior -- a 75x cut to the very component under
+# evaluation. Measured on an H100: the published prior costs 44.5 ms/step
+# against 25.3 ms (~4.95 h vs ~2.81 h for 400k steps) and 10.4 ms vs 7.6 ms per
+# sampling step, so it fits the same ~19.5 h budget. We therefore match on
+# WALL-CLOCK plus GENERATIVE capacity and report the codec separately, exactly
+# as latent-diffusion papers exclude the VAE from their parameter counts.
+#
+# Trainable parameters at inference: codec (decoder) 5,183,236
+#   + generative prior 113,668,609 = 118,851,845.
+# NOT within +/-10% of 6,506,253 -- deliberately so; parameter_budget.enforce is
+# false for this arm ONLY. Arms C and F remain the strict-matched pair.
+# Latent bottleneck: 1024 scalars per snapshot. The comparison model carries a
+# 128 x 256 = 32,768-scalar global latent with NO compressive bottleneck, i.e.
+# 32x larger. That bottleneck is CoNFiLD's defining scientific claim, so it
+# is NOT equalised; the two arms bracket it instead.
+baseline_model: confild
+training_stage: 1
+
+shared:
+  demo_num: 23
+  seed: 42
+  device_ids: [0]
+  reload: false
+  paths:
+    data_path: data/JHU_4cubes_stride100.h5
+    save_root: outputs/runs/JHU/baseline_confild/unified_published_prior
+    config_backup_root: configs/backup/isotropic_turbulence/confild
+  data:
+    dataset_name: turbulent_combustion
+    train_ratio: 0.75
+    time_stride: 1
+    num_workers: 0
+    num_x: 125
+    num_y: 125
+    num_z: 125
+    field_names: [Ux, Uy, Uz, p]
+  conditioning:
+    cond_fields: [0, 2]
+    n_obs_min_list: [1953]
+    n_obs_max_list: [19531]
+    vis_cond_fields: [0, 2]
+    vis_n_obs_list: [19531]
+  logging:
+    eval_every: 10
+    save_every: 25
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+confild_params:
+  upstream_root: third_party/CoNFiLD
+  parameter_budget:
+    # The model the baselines are compared against, measured, not quoted.
+    comparison_model: 6506253
+    relative_tolerance: 0.10
+    # Waived for arm P by design; see the header. Arms C and F enforce it.
+    enforce: false
+
+  stage1:
+    training:
+      # Upstream case4.yml runs 30,000 epochs. We run to a wall-clock budget
+      # instead; `epochs` is only an upper bound the budget cuts short.
+      epochs: 100000
+      wallclock_budget_s: 48600          # 13.5 h of the 20 h total
+      batch_size: 8
+      # Upstream feeds every point of every item once per epoch. At 1,953,125
+      # points x 7,200 items that is impossible, so each item contributes a
+      # uniform random subsample per epoch. The SIREN loss is pointwise, so this
+      # is an unbiased estimator of the same objective.
+      points_per_item: 16384
+      # Upstream case4.yml verbatim. Neither rate is batch-size dependent here:
+      # the decoder takes exactly one Adam step per epoch on the epoch-summed
+      # gradient (Adam is invariant to a constant gradient rescale), and each
+      # latent is touched exactly once per epoch whatever the batch size.
+      decoder_learning_rate: 1.0e-4
+      latent_learning_rate: 1.0e-5
+      diagnostic_every: 10
+      diagnostic_items: 8
+      diagnostic_points: 65536
+      save_every: 50
+      cache_snapshots: true
+    architecture:
+      # Capacity-matched arm. Upstream's largest 3-D case is 32x34x62x3 =
+      # 201,984 DOF per snapshot; ours is 125^3 x 4 = 7,812,500, i.e. 39x
+      # larger. Holding the latent at upstream's 384 imposes a compression
+      # ratio 39x more aggressive than anything CoNFiLD was validated at, and a
+      # 384-scalar oracle code tops out at rel-L2 0.535 on this data. 1024
+      # scalars is the smallest power-of-two code that clears that ceiling. The
+      # decoder width is dropped 384 -> 256 so the extra code does not also buy
+      # extra decoder parameters; upstream's class already takes latent width
+      # and hidden width as separate arguments (case4.yml just sets both 384).
+      hidden_features: 256
+      latent_dim: 1024
+      layers: 15
+      tie_latent_to_hidden: false
+    augmentation:
+      # Shared protocol: 48 signed axis permutations. Upstream has no
+      # augmentation, so this multiplies the auto-decoder latent table (and the
+      # length of an upstream "epoch") by 48.
+      groups: 48
+
+  stage2:
+    stage1_checkpoint:
+    training:
+      steps: 2000000
+      wallclock_budget_s: 21600          # 6.0 h; 19.5 h total with stage 1
+      batch_size: 8                      # upstream case4.yml
+      learning_rate: 5.0e-5              # upstream case4.yml
+      log_every: 200
+      save_every: 5000
+    architecture:
+      cube_length: 50
+      window_length: 32
+      window_stride: 1
+      model_image_size: 1024
+      diffusion_steps: 1000              # upstream
+      # Upstream case4.yml verbatim: 128 channels, 2 res blocks, 64 head
+      # channels, channel_mult "1, 1, 2, 2, 4, 4". 113,668,609 parameters at
+      # our 1024-wide latent (108,410,369 at upstream's 384 width).
+      num_channels: 128
+      num_res_blocks: 2
+      num_heads: 4
+      num_head_channels: 64
+      attention_resolutions: "32,16,8"   # upstream string, verbatim
+      channel_mult: "1, 1, 2, 2, 4, 4"
+      ema: 0.9999                        # upstream

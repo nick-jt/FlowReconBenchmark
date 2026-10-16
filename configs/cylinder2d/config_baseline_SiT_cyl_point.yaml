@@ -1,0 +1,95 @@
+# =============================================================================
+# PoF-benchmark 2D cylinder -- SiT-POINT (point-tokenized) generative baseline
+# on the NATIVE MESH (Cylinder2D_mesh.h5, 23,800 cells), the discretization the
+# other point-based rows (DMF-Gen, Senseiver, MLP-RBF) use; the patch-tokenized
+# SiT (config_baseline_SiT_cyl, DemoN73) had to read the 200x400 grid export.
+# -----------------------------------------------------------------------------
+# Architecture = the 3D JHTDB matched point run (launcher
+# train_sit_xcube_matched): pointnet tokenizer, depth 6 x hidden 240 x 4 heads,
+# node_subsample 8192, nearest-sensor fill, MSE velocity loss, Euler N=32.
+# Re-holdout protocol identical to config_baseline_Det_cyl: JHU_SPLIT_MODE=block
+# JHU_SPLIT_GAP=0, train_ratio 0.6667 = frames [0,1200) train Re{60,100,150,200}
+# / [1200,1800) held-out Re{80,250}. Sensors 0.1-2% of 23800 per observed
+# field; p never observed (identifiability probe). This row REPLACES the
+# patch-tokenized SiT in the 2D tables (decided 2026-09-28).
+# Budget: bs 24 -> 50 steps/ep -> 1000 ep = 50k optimizer steps (fleet-matched).
+# =============================================================================
+
+baseline_model: sit
+training_stage: 1
+
+shared:
+  demo_num: 77
+  seed: 42
+  device_ids: [0]
+  reload: true
+
+  paths:
+    data_path: "data/cylinder2d/Cylinder2D_mesh.h5"
+    save_root: "outputs/runs/cylinder2d/baseline_sit_point"
+    config_backup_root: "configs/cylinder2d/gen_baseline"
+
+  data:
+    dataset_name: "cylinder2d"
+    train_ratio: 0.6667
+    time_stride: 1
+    num_workers: 4
+    num_x: 400                  # unused by the point tokenizer (mesh is not
+    num_y: 200                  # reshapeable); kept for the shared-config schema
+    field_names: ["Ux", "Uy", "p"]
+
+  conditioning:
+    cond_fields: [0, 1]         # velocities observed; p never observed
+    n_obs_min_list: [24]        # 0.1% of 23800, broadcast to both fields
+    n_obs_max_list: [476]       # 2%
+    vis_cond_fields: [0, 1]
+    vis_n_obs_list: [238]
+
+  logging:
+    eval_every: 5
+    save_every: 200
+
+  overrides:
+    epochs:
+    batch_size:
+    learning_rate:
+    weight_decay:
+
+sit_params:
+  training:
+    epochs: 1000                # 50 steps/ep x 1000 = 50k steps
+    batch_size: 24
+    optimizer: upstream         # SiT train.py: AdamW 1e-4, no weight decay, constant LR, no clipping
+    learning_rate: 1.0e-4
+    weight_decay: 0.0
+    eval_every: 5
+    save_every: 200
+    huber_beta: 0.0             # SiT's MSE velocity loss, as the JHU matched run
+
+  architecture:
+    patch_size: 8               # unused in pointnet mode
+    hidden_size: 240
+    depth: 6
+    num_heads: 4
+    mlp_ratio: 4.0
+    tokenizer: "pointnet"
+    coord_dim: 2
+    fourier_num_freqs: 64
+    fourier_scale: 10.0
+    ema_rate: 0.9999
+    node_subsample: 8192        # token budget per step / sampling chunk (3 chunks per field);
+                                # all 23,800 nodes fit (73.6 GB) but cost 489 s/epoch, 136 h per run
+    cond_fill_sigma: 0.05
+
+  transport:
+    path_type: "Linear"
+    prediction: "velocity"
+    loss_weight:
+
+  conditioning:
+    cond_mode: "interp"
+
+  sampling:
+    sampling_N: 32
+    ode_solver: "euler"
+    benchmark_n_steps: [32]
